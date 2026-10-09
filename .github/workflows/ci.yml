@@ -57,7 +57,7 @@ jobs:
       # **INTERNALERROR** 结束，**不打印任何 `tests/...::test_` 行** → TOTAL=0 →
       # "TOTAL>0 才判定"的条件永远不会成立，守卫沦为摆设。
       # 因此判据必须同时覆盖「收集数 == 0」这一情形。
-      - name: Guard: Qt 用例不得全部被跳过
+      - name: "Guard: Qt 用例不得全部被跳过"
         if: always()
         env:
           QT_QPA_PLATFORM: offscreen
