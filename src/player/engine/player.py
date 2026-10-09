@@ -255,6 +255,13 @@ class AudioEngine:
                 except Exception:  # noqa: BLE001
                     pass
             self._close_decoder()
+        if errored:
+            # 【约束2】日志只在主线程写：音频回调里不做任何可能阻塞的 IO。
+            logger.error(
+                "decode error code=%s detail=%s",
+                code.value if code is not None else "unknown",
+                msg,
+            )
         if finished and self.on_finished is not None:
             self.on_finished()
         if errored and self.on_error is not None:
@@ -505,7 +512,8 @@ class AudioEngine:
                 yield out
         except Exception as exc:  # noqa: BLE001
             # 【P0-3】只捕获 Exception（不捕获 GeneratorExit），异常绝不穿出到音频线程。
-            logger.error("decode error: %s", exc)
+            # 【约束2】音频回调内禁止阻塞 IO：这里**不打日志**，只把错误交给 _on_error 暂存，
+            # 由主线程 poll() 统一记录（见 poll() 中的 logger.error）。
             self._on_error(generation, ErrorCode.FILE_CORRUPT, str(exc))
         else:
             # 循环正常结束 = 自然播完（被 close() 中断时走 GeneratorExit，不会到这里；
