@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import array
+import gc
 import math
 import os
 import pytest  # noqa: E402
@@ -60,10 +61,37 @@ for _p in (A, B):
         pass
 
 
+_ENGINES: list = []
+
+
 def new_engine(**kw):
     e = AudioEngine(**kw)
     e.set_volume(1.0)
+    _ENGINES.append(e)
     return e
+
+
+def drain_gc():
+    """【3.10 CI 兼容】统计窗口前显式落地所有遗留 raw.close。
+
+    引擎↔设备↔生成器构成引用环：未 stop 的引擎要等**循环 GC** 才会执行
+    生成器 finally（_stream_file 的 finally 记 raw.close）。循环 GC 的触发
+    时机随 CPython 版本浮动 —— CI 的 3.10 恰好在 F7-9 统计窗口内触发，
+    多记 2 次 raw.close，把"恰好关闭一次"误判成红（3.11/3.12 未触发故
+    一直绿）。对策：注册表里所有引擎显式 stop + settle，再强制 gc.collect()
+    让引用环里的生成器 finally 全部在窗口之前跑完，使断言与 GC 时机解耦。
+    """
+    for eng in _ENGINES:
+        try:
+            eng.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            settle(eng, limit=100)
+        except Exception:  # noqa: BLE001
+            pass
+    _ENGINES.clear()
+    gc.collect()
 
 
 def _exh(gen) -> bool:
@@ -296,11 +324,19 @@ def test_f7_interrupt():
           f"{before}->{e._frames_played}")
     check("F7-9 中断后旧生成器 next() 抛 StopIteration", _exh(old_stream))
 
+    # 【3.10 CI 兼容】先删掉遗留生成器引用并显式收掉所有遗留引擎（含被变量
+    # 遮蔽的旧引擎），强制 gc.collect() 让全部 raw.close 在统计窗口**之前**落地。
+    del stale, old_stream, stale_stream
+    drain_gc()
+
     n_close = len(CLOSES)
     e2 = new_engine()
     e2.load(A)
     e2.play()
     CLOSES.clear()
+    # 【加固】窗口内也强制 GC：若仍有任何遗留流未收，此处会立刻暴露为红，
+    # 而不是像 CI 3.10 那样随解释器版本"看运气"触发 —— 断言与 GC 时机解耦。
+    gc.collect()
     e2.stop()
     settle(e2)
     check("F7-9 淡出中断后旧解码器恰好关闭一次", len(CLOSES) == 1, str(CLOSES))
@@ -382,6 +418,10 @@ def test_f7_interrupt():
           e._fade.current_target == 0.0, str(e._fade.current_target))
     check("B5 mute 不重置淡出进度（单调下降）", g_muted <= g_before + 1e-9 and g_after <= g_muted + 1e-9,
           f"{g_before:.4f}->{g_muted:.4f}->{g_after:.4f}")
+
+    # 【3.10 CI 兼容】测试收尾同样先显式落地所有遗留 close，避免污染
+    # 后续 pytest 用例（test_fade_envelope 等）各自的 CLOSES 统计窗口。
+    drain_gc()
 
     # 汇总：任一断言失败则整个用例失败（失败清单会完整列出）
     assert not _FAILS, f"{len(_FAILS)} 项断言失败：" + "; ".join(_FAILS)
