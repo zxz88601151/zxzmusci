@@ -553,6 +553,19 @@ _e.set_muted(False)
 check("C4 解除静音后恢复音量", close(_e.target_gain, linear_to_db_gain(0.9), 1e-12),
       f"{_e.target_gain:.5f}")
 
+# ═══════════════ I. 参数表核对 ═══════════════
+print("── I. 参数表 ──")
+from player.engine.player import SEEK_FADE_SKIP_MS  # noqa: E402
+from player.engine.volume_curve import MIN_DB  # noqa: E402
+
+check("参数 MIN_DB == -60（dB 下限，负号）", MIN_DB == -60.0, str(MIN_DB))
+check("参数 FADE_IN_MS == 200", FADE_IN_MS == 200.0, str(FADE_IN_MS))
+check("参数 FADE_OUT_MS == 300", FADE_OUT_MS == 300.0, str(FADE_OUT_MS))
+check("参数 VOLUME_SMOOTH_MS == 80", VOLUME_SMOOTH_MS == 80.0, str(VOLUME_SMOOTH_MS))
+check("参数 SEEK_FADE_SKIP_MS == 100", SEEK_FADE_SKIP_MS == 100.0, str(SEEK_FADE_SKIP_MS))
+_e = AudioEngine(seek_fade_skip_ms=250)
+check("参数 seek_fade_skip_ms 可构造覆盖", _e.seek_fade_skip_ms == 250.0, str(_e.seek_fade_skip_ms))
+
 print()
 print("RESULT:", "ALL PASS" if not _FAILS else f"{len(_FAILS)} FAILED -> {_FAILS}")
 sys.exit(1 if _FAILS else 0)

@@ -59,7 +59,7 @@ _PCM_MAX = 32767
 FADE_IN_MS = 200.0            # 淡入时长
 FADE_OUT_MS = 300.0           # 淡出时长
 VOLUME_SMOOTH_MS = 80.0       # 音量平滑时间常数（50~100ms）
-SEEK_FADE_THRESHOLD_MS = 500.0  # 跳转距离阈值：小于此值视为"短跳"，不做淡出
+SEEK_FADE_SKIP_MS = 100.0     # seek 跳跃 < 此值视为"短跳"：跳过 ramp-out（内容几乎连续）
 _FADE_MARGIN = 0.005          # 等待淡出走完的额外余量（秒）
 _DEFAULT_VOLUME = 0.8
 
@@ -93,11 +93,13 @@ class AudioEngine:
         fade_in_ms: float = FADE_IN_MS,
         fade_out_ms: float = FADE_OUT_MS,
         smooth_ms: float = VOLUME_SMOOTH_MS,
+        seek_fade_skip_ms: float = SEEK_FADE_SKIP_MS,
     ) -> None:
         # 【C2】三个时长抽成构造参数：改任一个都不影响另外两个。
         self._fade_in_ms = float(fade_in_ms)
         self._fade_out_ms = float(fade_out_ms)
         self._smooth_ms = float(smooth_ms)
+        self._seek_fade_skip_ms = float(seek_fade_skip_ms)
         self._device: miniaudio.PlaybackDevice | None = None
         self._stream: Iterator[array.array] | None = None
         self._path: str | None = None
@@ -230,9 +232,12 @@ class AudioEngine:
     def seek(self, seconds: float) -> None:
         """取消淡出，在新位置启动淡入。
 
-        【此处需要重构 X】长跳转的完整淡出与 P1-2「seek 后旧代次回调立即丢弃」互斥：
-        要淡出就必须让旧流继续产出，要立即丢弃就必须立刻失效代次。当前选择**立即失效**
-        （保住 P1-2），旧流只做一段快速 ramp-out 尾巴（~20ms）以消爆音。
+        【SEEK_FADE_SKIP_MS】跳跃距离 < 阈值视为"短跳"：音频内容几乎连续，
+        连 ramp-out 尾巴都省掉（0 等待）；≥ 阈值则做一段快速 ramp-out 消爆音。
+
+        【此处需要重构 X】长跳转的**完整 300ms 淡出**与 P1-2「seek 后旧代次回调立即丢弃」
+        互斥（要淡出就得让旧流继续产出，要立即丢弃就得立刻失效代次）。当前选择保住 P1-2，
+        只用一段 ~20ms 的 ramp-out 尾巴，不做完整淡出。
         """
         if not self._path or self._duration <= 0:
             return
@@ -240,6 +245,8 @@ class AudioEngine:
         frame = int(seconds * _SAMPLE_RATE)
         with self._lock:
             was_playing = self._state is State.PLAYING
+            jump_ms = abs(seconds - self._frames_played / _SAMPLE_RATE) * 1000.0
+            need_ramp = jump_ms >= self._seek_fade_skip_ms
             if self._state is State.FINISHED:
                 self._state = State.PAUSED
             self._generation += 1          # 立即失效：旧代次进度/EOF/错误全部丢弃
@@ -247,7 +254,8 @@ class AudioEngine:
             self._pending_finished = False
             self._fade.reset(1.0, self._fade_in_ms)  # 取消任何进行中的淡出，改为新位置淡入
         if was_playing and self._device is not None:
-            time.sleep(_FADE_MARGIN + 0.015)   # 等一个 chunk 的 ramp-out 尾巴
+            if need_ramp:
+                time.sleep(_FADE_MARGIN + 0.015)  # 等一个 chunk 的 ramp-out 尾巴
             self._device.stop()
             self._close_decoder()
             self._start_stream(frame, 0.0)
@@ -348,6 +356,10 @@ class AudioEngine:
     @property
     def smooth_ms(self) -> float:
         return self._smooth_ms
+
+    @property
+    def seek_fade_skip_ms(self) -> float:
+        return self._seek_fade_skip_ms
 
     @property
     def target_gain(self) -> float:

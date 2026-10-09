@@ -3,10 +3,10 @@
 链路：滑块 volume ∈ [0,1] → dB → 线性增益 gain ∈ [0,1]
 
 等响近似：
-    gain = 10 ** ((v - 1.0) * MIN_DB / 20)
+    gain = 10 ** (MIN_DB * (1.0 - v) / 20)
     - v = 1.0 → 0 dB    → gain = 1.0        （满音量）
-    - v = 0.5 → -MIN_DB/2 dB                （MIN_DB=60 时 ≈ 0.0316，听感约"一半"）
-    - v = 0.0 → 直接返回 0.0（真静音，不是 -MIN_DB 的残余增益）
+    - v = 0.5 → MIN_DB/2 = -30 dB          （≈ 0.0316，听感约"一半"）
+    - v = 0.0 → 直接返回 0.0（真静音，比 -60dB 更低）
 
 【规格冲突已确认】原文同时写了「v=0 → gain≈0.0001（-80dB）」与
 「gain = 10**((v-1)*60/20)（-60dB~0dB）」。二者不可同时成立：
@@ -17,8 +17,12 @@
 
 from __future__ import annotations
 
-# 可配置：动态范围下界（dB）。60 对应 v=0.5 → 10**(-1.5) ≈ 0.0316。
-MIN_DB = 60.0
+import math
+
+# 可配置：动态范围下限（dB，负值）。-60 表示最大衰减 60dB。
+# v=0.5 → 10**(-60*0.5/20) = 10**(-1.5) ≈ 0.0316（听感约"一半"）。
+# 注意：v<=0 直接返回 0.0（真静音），即"至少衰减到 MIN_DB 以下"，而非停在 -60dB。
+MIN_DB = -60.0
 
 
 def clamp01(v: float) -> float:
@@ -37,15 +41,19 @@ def clamp01(v: float) -> float:
 
 
 def linear_to_db_gain(v: float) -> float:
-    """滑块值 → 线性增益（等响近似）。v<=0 返回 0.0（真静音）。"""
+    """滑块值 → 线性增益（等响近似）。
+
+    gain = 10 ** (MIN_DB * (1 - v) / 20)，MIN_DB=-60 → v=1 时 0dB、v→0 时逼近 -60dB。
+    v<=0 返回 0.0（真静音，不留在 -60dB 的残余增益上）。
+    """
     v = clamp01(v)
     if v <= 0.0:
         return 0.0
-    return 10.0 ** ((v - 1.0) * MIN_DB / 20.0)
+    return 10.0 ** (MIN_DB * (1.0 - v) / 20.0)
 
 
 def db_to_linear(db: float) -> float:
-    """dB → 线性增益。0dB→1.0；<= -MIN_DB → 0.0；非法输入夹边界。"""
+    """dB → 线性增益。0dB→1.0；<= MIN_DB → 0.0；非法输入夹边界。"""
     try:
         x = float(db)
     except (TypeError, ValueError):
@@ -54,28 +62,26 @@ def db_to_linear(db: float) -> float:
         return 0.0
     if x >= 0.0:
         return 1.0
-    if x <= -MIN_DB:
+    if x <= MIN_DB:
         return 0.0
     return 10.0 ** (x / 20.0)
 
 
 def gain_to_db(gain: float) -> float:
-    """线性增益 → dB（供 UI 显示）。gain<=0 → 返回 -MIN_DB（下界）。"""
+    """线性增益 → dB（供 UI 显示）。gain<=0 → 返回 MIN_DB（下限）。"""
     try:
         g = float(gain)
     except (TypeError, ValueError):
-        return -MIN_DB
+        return MIN_DB
     if g != g or g <= 0.0:  # NaN / 静音
-        return -MIN_DB
-    import math
-
-    return max(-MIN_DB, 20.0 * math.log10(g))
+        return MIN_DB
+    return max(MIN_DB, 20.0 * math.log10(g))
 
 
 def slider_db(v: float) -> float:
     """滑块值 → 显示用 dB（V6）。
 
-    - v = 0.0 → -MIN_DB（默认 -60.0）
+    - v = 0.0 → MIN_DB（默认 -60.0）
     - v = 1.0 → 0.0
     - 在 [0,1] 上严格单调递增
     """

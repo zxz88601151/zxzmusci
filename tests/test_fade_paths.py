@@ -74,7 +74,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from player.engine.player import (  # noqa: E402
     FADE_IN_MS,
     FADE_OUT_MS,
-    SEEK_FADE_THRESHOLD_MS,
+    SEEK_FADE_SKIP_MS,
     AudioEngine,
 )
 from player.engine.states import ErrorCode  # noqa: E402
@@ -254,10 +254,19 @@ e2 = new_engine()
 e2.load(A)
 e2.play()
 t0 = time.perf_counter()
-e2.seek(0.001)  # 极短跳
+e2.seek(0.001)  # 极短跳 < SEEK_FADE_SKIP_MS
 short_ms = (time.perf_counter() - t0) * 1000
-check("F8 短跳（<阈值）耗时明显更短", short_ms < SEEK_FADE_THRESHOLD_MS,
-      f"短跳 {short_ms:.0f}ms / 阈值 {SEEK_FADE_THRESHOLD_MS}ms")
+check("F8 短跳（< SEEK_FADE_SKIP_MS）跳过 ramp-out，几乎零等待", short_ms < 5.0,
+      f"短跳 {short_ms:.1f}ms / 阈值 {SEEK_FADE_SKIP_MS}ms")
+
+e3 = new_engine()
+e3.load(A)
+e3.play()
+t0 = time.perf_counter()
+e3.seek(2.0)  # 长跳 ≥ SEEK_FADE_SKIP_MS
+long_ms = (time.perf_counter() - t0) * 1000
+check("F8 长跳（≥ SEEK_FADE_SKIP_MS）执行 ramp-out", long_ms >= 15.0, f"长跳 {long_ms:.1f}ms")
+check("F8 SEEK_FADE_SKIP_MS 默认 100", SEEK_FADE_SKIP_MS == 100.0, str(SEEK_FADE_SKIP_MS))
 
 # ═══════════ F9 自然播完 → FINISHED；error → 立即停 ═══════════
 print("── F9 ──")
