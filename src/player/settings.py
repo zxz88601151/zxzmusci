@@ -21,6 +21,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_VOLUME = 0.8
 _KEY_VOLUME = "volume"
 
+# 【C1/C2】淡入淡出时长持久化（毫秒）。引擎只认毫秒数，不认"音乐/播客"等业务概念。
+_KEY_FADE_IN = "fade_in_ms"
+_KEY_FADE_OUT = "fade_out_ms"
+DEFAULT_FADE_IN_MS = 200.0
+DEFAULT_FADE_OUT_MS = 300.0
+FADE_MS_MIN = 0.0
+FADE_MS_MAX = 2000.0
+
+
+def clamp_range(value, lo: float, hi: float, name: str, default: float) -> float:
+    """越界/非法值夹回边界并记 warning；无法解析则回退 default（C2）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        logger.warning("settings %s 非法(%r)，回退默认 %s", name, value, default)
+        return default
+    if v != v:  # NaN
+        logger.warning("settings %s 为 NaN，回退默认 %s", name, default)
+        return default
+    if v < lo:
+        logger.warning("settings %s=%s 越界，夹到下限 %s", name, v, lo)
+        return lo
+    if v > hi:
+        logger.warning("settings %s=%s 越界，夹到上限 %s", name, v, hi)
+        return hi
+    return v
+
 
 def default_path() -> str:
     """默认落盘位置：用户主目录下的 .musicplayer/settings.json。"""
@@ -60,11 +87,33 @@ class Settings:
     # ---------- 音量（linear 0~1）----------
     @property
     def volume(self) -> float:
-        return clamp01(self._data.get(_KEY_VOLUME, DEFAULT_VOLUME))
+        raw = self._data.get(_KEY_VOLUME, DEFAULT_VOLUME)
+        v = clamp_range(raw, 0.0, 1.0, "volume", DEFAULT_VOLUME)
+        return clamp01(v)
 
     @volume.setter
     def volume(self, v: float) -> None:
-        self._data[_KEY_VOLUME] = clamp01(v)
+        self._data[_KEY_VOLUME] = clamp_range(v, 0.0, 1.0, "volume", DEFAULT_VOLUME)
+
+    @property
+    def fade_in_ms(self) -> float:
+        raw = self._data.get(_KEY_FADE_IN, DEFAULT_FADE_IN_MS)
+        return clamp_range(raw, FADE_MS_MIN, FADE_MS_MAX, _KEY_FADE_IN, DEFAULT_FADE_IN_MS)
+
+    @fade_in_ms.setter
+    def fade_in_ms(self, v: float) -> None:
+        self._data[_KEY_FADE_IN] = clamp_range(v, FADE_MS_MIN, FADE_MS_MAX, _KEY_FADE_IN,
+                                               DEFAULT_FADE_IN_MS)
+
+    @property
+    def fade_out_ms(self) -> float:
+        raw = self._data.get(_KEY_FADE_OUT, DEFAULT_FADE_OUT_MS)
+        return clamp_range(raw, FADE_MS_MIN, FADE_MS_MAX, _KEY_FADE_OUT, DEFAULT_FADE_OUT_MS)
+
+    @fade_out_ms.setter
+    def fade_out_ms(self, v: float) -> None:
+        self._data[_KEY_FADE_OUT] = clamp_range(v, FADE_MS_MIN, FADE_MS_MAX, _KEY_FADE_OUT,
+                                                DEFAULT_FADE_OUT_MS)
 
     @property
     def path(self) -> str:

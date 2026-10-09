@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import array
+import logging
 import math
 import os
 import sys
@@ -142,6 +143,25 @@ def steady_engine(volume: float) -> AudioEngine:
 
 
 TMP = tempfile.mkdtemp()
+
+
+def settle(e, limit=900):
+    """把淡出推到底并让 poll() 收尾（模拟设备持续拉流 + UI 定时 poll）。
+
+    【F7 语义变更】stop()/pause() 改为非阻塞后，"停止完成"不再发生在调用返回时，
+    而是发生在淡出走完 + poll() 收尾之后。断言因此需要先 settle 再检查终态。
+    """
+    for _ in range(limit):
+        gen = e._stream
+        if gen is not None:
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+        e.poll()
+        if not e.fade_pending and e._pending_finalize is None:
+            return
+
 A = os.path.join(TMP, "a.mp3")
 B = os.path.join(TMP, "b.mp3")
 for _p in (A, B):
@@ -272,7 +292,9 @@ e.play()
 gen = e._stream
 before_stop = e._device.stopped
 e.stop()
-check("E4 stop 期间 state 曾为 PLAYING→终态 STOPPED", e.state == "stopped", e.state)
+check("E4 淡出期间 state 仍 PLAYING（B4）", e.state == "playing" and e.fade_pending, e.state)
+settle(e)
+check("E4 淡出完成后才转 STOPPED", e.state == "stopped", e.state)
 check("E5 stop 后才 device.stop()", e._device.stopped == before_stop + 1, str(e._device.stopped))
 check("E6 stop 后解码器已关（旧生成器耗尽）", e._stream is None and _is_exhausted(gen))
 
@@ -282,7 +304,9 @@ e.set_volume(1.0)
 e.load(A)
 e.play()
 e.pause()
-check("E7 pause → 终态 PAUSED", e.state == "paused", e.state)
+check("E7 淡出期间 state 仍 PLAYING", e.state == "playing" and e.fade_pending, e.state)
+settle(e)
+check("E7 淡出完成后 → PAUSED", e.state == "paused", e.state)
 
 # E8 error → 立即停止，不淡出
 BACKEND["mode"] = "error"
@@ -344,7 +368,8 @@ e.load(A)
 e.play()
 g = e._stream
 e.stop()
-check("F2 stop 后 _stream 已清空", e._stream is None)
+settle(e)
+check("F2 stop（settle 后）_stream 已清空", e._stream is None)
 check("F3 stop 后旧生成器已耗尽", _is_exhausted(g))
 
 # F4 FINISHED 重播
@@ -511,10 +536,18 @@ _e3 = AudioEngine(fade_out_ms=600)
 _e3.set_volume(1.0)
 _e3.load(A)
 _e3.play()
-_t0 = time.perf_counter()
+# 【F7 语义变更】stop() 不再阻塞；改为验证"淡出实际消耗的帧数 ≈ fade_out_ms"
+_frames = 0
 _e3.stop()
-_el = (time.perf_counter() - _t0) * 1000
-check("C2 淡出 600ms 生效（stop 阻塞 ≥600ms）", _el >= 600 * 0.95, f"{_el:.0f}ms")
+while _e3.fade_pending and _frames < 10 * _SR:
+    try:
+        _frames += len(next(_e3._stream)) // 2
+    except StopIteration:
+        break
+_e3.poll()
+_expect = int(600 / 1000 * _SR)
+check("C2 淡出 600ms 生效（实际推进帧数 ≈ 600ms）",
+      abs(_frames - _expect) <= _expect * 0.25, f"{_frames} 帧 vs 期望 {_expect} 帧")
 
 # C3 音量记忆：存 linear 0~1，恢复后听感一致
 _p = os.path.join(tempfile.mkdtemp(), "settings.json")
@@ -565,6 +598,134 @@ check("参数 VOLUME_SMOOTH_MS == 80", VOLUME_SMOOTH_MS == 80.0, str(VOLUME_SMOO
 check("参数 SEEK_FADE_SKIP_MS == 100", SEEK_FADE_SKIP_MS == 100.0, str(SEEK_FADE_SKIP_MS))
 _e = AudioEngine(seek_fade_skip_ms=250)
 check("参数 seek_fade_skip_ms 可构造覆盖", _e.seek_fade_skip_ms == 250.0, str(_e.seek_fade_skip_ms))
+
+# ═══════════════ J. C1~C6 断言清单 ═══════════════
+print("── J. C1~C6 ──")
+import glob  # noqa: E402
+import re  # noqa: E402
+
+from player.engine.player import FADE_IN_MS, FADE_OUT_MS  # noqa: E402
+from player.settings import FADE_MS_MAX, FADE_MS_MIN  # noqa: E402
+
+# C1 settings 写入 fade_in=600 / fade_out=1500 → 重启后引擎实际使用
+_pj = os.path.join(tempfile.mkdtemp(), "settings.json")
+_sj = Settings(_pj)
+_sj.fade_in_ms = 600.0
+_sj.fade_out_ms = 1500.0
+_sj.save()
+_sj2 = Settings(_pj)
+check("C1 重启后读回 fade_in=600 / fade_out=1500",
+      _sj2.fade_in_ms == 600.0 and _sj2.fade_out_ms == 1500.0,
+      f"{_sj2.fade_in_ms}/{_sj2.fade_out_ms}")
+_ej = AudioEngine(fade_in_ms=_sj2.fade_in_ms, fade_out_ms=_sj2.fade_out_ms)
+check("C1 引擎实际使用 600/1500", _ej.fade_in_ms == 600.0 and _ej.fade_out_ms == 1500.0,
+      f"{_ej.fade_in_ms}/{_ej.fade_out_ms}")
+
+# C2 越界/非法 → clamp 到 [0,2000] + warning，不崩溃
+_warns: list[str] = []
+
+
+class _WH(logging.Handler):
+    def emit(self, r):
+        _warns.append(r.getMessage())
+
+
+_slg = logging.getLogger("player.settings")
+_slg.setLevel(logging.DEBUG)
+_slg.addHandler(_WH())
+_c2_ok = True
+for _bad, _exp in ((-100, FADE_MS_MIN), (9999, FADE_MS_MAX), ("abc", 200.0), (None, 200.0)):
+    try:
+        _sj.fade_in_ms = _bad
+        _got = _sj.fade_in_ms
+        if abs(_got - _exp) > 1e-9:
+            _c2_ok = False
+    except Exception:
+        _c2_ok = False
+check("C2 越界/非法值 clamp 到 [0,2000] 且不崩溃", _c2_ok, f"fade_in={_sj.fade_in_ms}")
+check("C2 越界与非法输入均记录 warning", len(_warns) >= 4, f"{len(_warns)} 条 warning")
+
+# C3 滑块 dB 单调、0→-60dB、1→0dB
+_dbs = [slider_db(i / 100) for i in range(101)]
+check("C3 dB 显示 0→-60dB、1→0dB、单调递增",
+      close(_dbs[0], -60.0, 1e-9) and close(_dbs[-1], 0.0, 1e-9)
+      and all(b >= a for a, b in zip(_dbs, _dbs[1:])),
+      f"{_dbs[0]:.1f} → {_dbs[-1]:.1f}")
+
+# C4 音量持久化为 linear，恢复后 RMS 比值误差 <5%
+_sv = Settings(os.path.join(tempfile.mkdtemp(), "s.json"))
+_sv.volume = 0.42
+_sv.save()
+_restored = Settings(_sv.path).volume
+_sig = sine(4096)
+_e4 = steady_engine(0.42)
+_r_a = rms(_e4._apply_gain_envelope(_sig, 4096)) / rms(_sig)
+_e5 = steady_engine(_restored)
+_r_b = rms(_e5._apply_gain_envelope(_sig, 4096)) / rms(_sig)
+check("C4 恢复后听感一致（RMS 比值误差 <5%）",
+      abs(_r_a - _r_b) / max(1e-9, _r_a) < 0.05, f"{_r_a:.5f} vs {_r_b:.5f}")
+
+# C5 静音下切歌仍静音
+BACKEND.update(duration=5.0, chunks=50, frames_per_chunk=2000, mode="ok")
+_e6 = AudioEngine()
+_e6.set_volume(1.0)
+_e6.set_muted(True)
+_e6.load(A)
+_e6.play()
+_out6 = next(_e6._stream)
+check("C5 静音下切歌 → 新歌仍静音（全 0）", all(v == 0 for v in _out6),
+      f"max|s|={max(abs(v) for v in _out6)}")
+
+# C6 调参后断言自动适配：①行为随参数缩放 ②断言不写死 200/300
+def _fade_frames(ms):
+    _e = AudioEngine(fade_out_ms=ms)
+    _e.set_volume(1.0)
+    _e.load(A)
+    _e.play()
+    _n = 0
+    _e.stop()
+    while _e.fade_pending and _n < 20 * _SR:
+        try:
+            _n += len(next(_e._stream)) // 2
+        except StopIteration:
+            break
+    _e.poll()
+    return _n
+
+
+_f300, _f600 = _fade_frames(300.0), _fade_frames(600.0)
+check("C6 淡出行为随参数缩放（300→600 约翻倍）", 1.6 < _f600 / max(1, _f300) < 2.4,
+      f"{_f300} 帧 vs {_f600} 帧")
+# 变异测试：把 fade_out_ms 改成 0/80/300/1500，控制路径延迟与终态都必须一致。
+# 若任何断言写死了 300/200，调参后必然在这里暴露。
+def _burst_ms(_ms):
+    _e = AudioEngine(fade_out_ms=_ms)
+    _e.set_volume(1.0)
+    _e.load(A)
+    _e.play()
+    _t0 = time.perf_counter()
+    for _i in range(5):
+        _e.load(B if _i % 2 else A)
+        _e.play()
+    _dt = (time.perf_counter() - _t0) * 1000
+    _ok = os.path.basename(_e.current_path) == "a.mp3" and _e.state == "playing"
+    return _dt, _ok
+
+
+_lat = {}
+for _ms in (0.0, 80.0, 300.0, 1500.0):
+    _lat[_ms] = _burst_ms(_ms)
+check("C6 调参（0/80/300/1500ms）后控制路径延迟不变且均 <500ms",
+      all(_d < 500.0 and _ok for _d, _ok in _lat.values()),
+      str({k: round(v[0], 2) for k, v in _lat.items()}))
+
+# 静态检查：测试文件不得重新定义常量（否则"改常量"不会生效）
+_redef: list[str] = []
+for _tf in glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_*.py")):
+    for _ln, _line in enumerate(open(_tf, encoding="utf-8"), 1):
+        if re.match(r"\s*(FADE_IN_MS|FADE_OUT_MS|VOLUME_SMOOTH_MS|SEEK_FADE_SKIP_MS)\s*=", _line):
+            _redef.append(f"{os.path.basename(_tf)}:{_ln}")
+check("C6 测试未重新定义时长常量（改常量即可全局生效）", not _redef, str(_redef))
 
 print()
 print("RESULT:", "ALL PASS" if not _FAILS else f"{len(_FAILS)} FAILED -> {_FAILS}")

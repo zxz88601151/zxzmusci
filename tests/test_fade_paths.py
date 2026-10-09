@@ -103,6 +103,20 @@ for _p in (A, B):
         pass
 
 
+def settle(e, limit=900):
+    """【F7 语义变更】stop()/pause() 非阻塞后，终态在淡出走完 + poll() 收尾之后。"""
+    for _ in range(limit):
+        gen = e._stream
+        if gen is not None:
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+        e.poll()
+        if not e.fade_pending and e._pending_finalize is None:
+            return
+
+
 def new_engine():
     e = AudioEngine()
     e.set_volume(1.0)
@@ -153,11 +167,12 @@ before = e._device.stopped
 t0 = time.perf_counter()
 e.stop()
 elapsed_ms = (time.perf_counter() - t0) * 1000
-check("F2 stop 阻塞时长 ≥ 淡出时长（说明等淡出走完）", elapsed_ms >= FADE_OUT_MS * 0.9,
-      f"{elapsed_ms:.0f}ms")
-check("F2 stop 后 device.stop() 才被调用", e._device.stopped == before + 1)
-check("F2 stop 后解码器已关", e._stream is None)
-check("F2 淡出时长 ≤300ms", FADE_OUT_MS <= 300.0, f"{FADE_OUT_MS}ms")
+check("F2 stop() 立即返回（非阻塞 <1ms）", elapsed_ms < 1.0, f"{elapsed_ms:.3f}ms")
+check("F2 stop() 返回时设备尚未停（淡出仍在进行）", e._device.stopped == before,
+      f"{e._device.stopped}")
+settle(e)
+check("F2 淡出走完后才 device.stop()", e._device.stopped == before + 1)
+check("F2 淡出走完后解码器已关", e._stream is None)
 
 # ═══════════ F3 淡出期间 state == PLAYING，静音完成才转 PAUSED/STOPPED ═══════════
 print("── F3 ──")
@@ -166,18 +181,22 @@ e.load(A)
 e.play()
 e._device.state_at_stop.clear()
 e.stop()
+check("F3 stop() 返回时 state 仍 playing（B4 不提前跳变）", e.state == "playing", e.state)
+settle(e)
 check("F3 device.stop() 那一刻 state 仍是 playing", e._device.state_at_stop == ["playing"],
       str(e._device.state_at_stop))
-check("F3 stop() 返回后 state=stopped", e.state == "stopped", e.state)
+check("F3 settle 后 state=stopped", e.state == "stopped", e.state)
 
 e = new_engine()
 e.load(A)
 e.play()
 e._device.state_at_stop.clear()
 e.pause()
+check("F3 pause() 返回时 state 仍 playing", e.state == "playing", e.state)
+settle(e)
 check("F3 pause：device.stop() 那刻 state 仍是 playing", e._device.state_at_stop == ["playing"],
       str(e._device.state_at_stop))
-check("F3 pause() 返回后 state=paused", e.state == "paused", e.state)
+check("F3 settle 后 state=paused", e.state == "paused", e.state)
 
 # ═══════════ F4 淡出中途 pause → 冻结；resume 从冻结值继续 ═══════════
 print("── F4 ──")
@@ -204,9 +223,10 @@ stopped_before = e._device.stopped
 t0 = time.perf_counter()
 e.stop()
 el = (time.perf_counter() - t0) * 1000
-check("F5 淡入中途 stop 不卡死（有界）", el < FADE_OUT_MS * 3, f"{el:.0f}ms")
+check("F5 淡入中途 stop 立即返回（不卡死）", el < 1.0, f"{el:.3f}ms")
+settle(e)
 check("F5 无双重释放（device.stop 恰好 +1）", e._device.stopped == stopped_before + 1)
-check("F5 终态 stopped", e.state == "stopped", e.state)
+check("F5 settle 后终态 stopped", e.state == "stopped", e.state)
 
 # ═══════════ F6 淡出中途切歌 → 旧歌淡出完成 → 新歌淡入 ═══════════
 print("── F6 ──")
@@ -218,9 +238,12 @@ old_gen = e.generation
 e.load(B)
 check("F6 切歌后 generation 已递增", e.generation > old_gen, f"{old_gen}->{e.generation}")
 check("F6 切歌后路径指向新歌", os.path.basename(e.current_path) == "b.mp3")
+handoff = e._handoff_gain
 e.play()
 g2 = pump_gains(e, 2)
-check("F6 新歌从 0 淡入（无爆音间隙）", g2[0] < 0.2, f"{g2[0]:.4f}")
+# 【F7】新歌从"接管点"淡入：增益与旧流末尾连续，无爆音间隙（不再固定从 0 起）
+check("F6 新歌从接管点淡入（增益连续，无爆音间隙）",
+      handoff > 0.0 and abs(g2[0] - handoff) < 0.05, f"handoff={handoff:.4f} first={g2[0]:.4f}")
 
 # ═══════════ F7 快速连点切歌 5 次 → 无累积延迟 ═══════════
 print("── F7 ──")
@@ -265,7 +288,9 @@ e3.play()
 t0 = time.perf_counter()
 e3.seek(2.0)  # 长跳 ≥ SEEK_FADE_SKIP_MS
 long_ms = (time.perf_counter() - t0) * 1000
-check("F8 长跳（≥ SEEK_FADE_SKIP_MS）执行 ramp-out", long_ms >= 15.0, f"长跳 {long_ms:.1f}ms")
+# 【F7】seek 也不再阻塞；长跳同样走"取消淡出 + 从接管点淡入"
+check("F8 长跳不再阻塞（<1ms）", long_ms < 1.0, f"长跳 {long_ms:.3f}ms")
+check("F8 长跳从接管点淡入", e3._handoff_gain >= 0.0, str(e3._handoff_gain))
 check("F8 SEEK_FADE_SKIP_MS 默认 100", SEEK_FADE_SKIP_MS == 100.0, str(SEEK_FADE_SKIP_MS))
 
 # ═══════════ F9 自然播完 → FINISHED；error → 立即停 ═══════════

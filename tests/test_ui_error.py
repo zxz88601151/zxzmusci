@@ -103,6 +103,12 @@ _lg = logging.getLogger("player")
 _lg.setLevel(logging.DEBUG)
 _lg.addHandler(_H())
 
+# 先隔离 Settings 到临时目录，避免读写用户真实配置
+import player.settings as _st0  # noqa: E402
+
+_SP0 = os.path.join(tempfile.mkdtemp(), "settings.json")
+mw.Settings = lambda: _st0.Settings(_SP0)
+
 w = mw.MainWindow()
 _calls = []
 mw.MainWindow._show_error_dialog = lambda self, report: (_calls.append(report), False)[1]

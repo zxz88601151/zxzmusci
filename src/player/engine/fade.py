@@ -25,6 +25,7 @@ class _FadeEnvelope:
         self._target = float(target)
         self._duration_ms = float(duration_ms)
         self._frozen = False
+        self._cancelled = False
         self._recompute()
 
     # ---------- 内部 ----------
@@ -40,7 +41,17 @@ class _FadeEnvelope:
         self._target = float(target)
         self._duration_ms = float(duration_ms)
         self._frozen = False
+        self._cancelled = False
         self._recompute()
+
+    def cancel(self) -> None:
+        """【F7】取消本包络：此后 step() 恒返回 0，不再产出任何增益。
+
+        用于"新流接管"——旧淡出立即作废，避免 5 连点时旧淡出串行排队。
+        """
+        self._cancelled = True
+        self._current = 0.0
+        self._frames_left = 0
 
     def step(self, n_frames: int) -> float:
         """推进 n_frames，返回本段的**起始增益**。
@@ -48,6 +59,8 @@ class _FadeEnvelope:
         调用方可用 `step(n)` 的返回值与本段结束后的 `current_gain` 做段内插值，
         得到逐帧平滑的包络（避免每 chunk 一级台阶的 zipper noise）。
         """
+        if self._cancelled:
+            return 0.0  # 【F7】已取消：不再产出增益
         if self._frozen or n_frames <= 0 or self._frames_left <= 0:
             return self._current
         start = self._current
@@ -66,6 +79,8 @@ class _FadeEnvelope:
         这样调用方按 `move` 帧做线性插值时，端点仍然精确命中，
         不会因为 chunk 粒度把包络"拉长"。
         """
+        if self._cancelled:
+            return (0.0, 0.0, 0)  # 【F7】已取消
         if self._frozen or n_frames <= 0 or self._frames_left <= 0:
             return (self._current, self._current, 0)
         start = self._current
@@ -99,6 +114,10 @@ class _FadeEnvelope:
     @property
     def frozen(self) -> bool:
         return self._frozen
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled
 
     @property
     def frames_left(self) -> int:

@@ -65,9 +65,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("音乐播放器")
         self.resize(520, 220)
 
-        self.engine = AudioEngine()
-        # 【C3】音量记忆：持久化的是 linear 0~1 滑块值，恢复后经同一条 dB 曲线 ⇒ 听感一致
+        # 【C3/C1】先读设置，再用它构造引擎（淡入淡出时长也持久化）
         self.settings = Settings()
+        self.engine = AudioEngine(
+            fade_in_ms=self.settings.fade_in_ms,
+            fade_out_ms=self.settings.fade_out_ms,
+        )
         self._seeking = False  # 用户正在拖进度条时，不让 timer 回写
         self._error_dialog_open = False  # 【P1-1】防止同一失败重复弹窗
         self._ui_generation = -1  # 【P1-2】UI 当前展示的流代次
@@ -168,8 +171,10 @@ class MainWindow(QMainWindow):
         self.vol_db.setText(f"{slider_db(value / 100.0):.1f} dB")
 
     def _persist_volume(self) -> None:
-        """【C3】落盘 linear 0~1 音量（拖动结束时写一次，避免每 tick 都落盘）。"""
+        """【C3/C1】落盘 linear 0~1 音量 + 淡入淡出时长（拖动结束时写一次）。"""
         self.settings.volume = self.vol.value() / 100.0
+        self.settings.fade_in_ms = self.engine.fade_in_ms
+        self.settings.fade_out_ms = self.engine.fade_out_ms
         self.settings.save()
 
     @guard_audio

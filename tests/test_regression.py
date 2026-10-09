@@ -89,6 +89,25 @@ def check(name, cond, extra=""):
 
 
 TMP = tempfile.mkdtemp()
+
+
+def settle(e, limit=900):
+    """把淡出推到底并让 poll() 收尾（模拟设备持续拉流 + UI 定时 poll）。
+
+    【F7 语义变更】stop()/pause() 改为非阻塞后，"停止完成"不再发生在调用返回时，
+    而是发生在淡出走完 + poll() 收尾之后。断言因此需要先 settle 再检查终态。
+    """
+    for _ in range(limit):
+        gen = e._stream
+        if gen is not None:
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+        e.poll()
+        if not e.fade_pending and e._pending_finalize is None:
+            return
+
 A = os.path.join(TMP, "a.mp3")
 B = os.path.join(TMP, "b.mp3")
 for _p in (A, B):
@@ -209,9 +228,13 @@ e = new_engine()
 e.load(A)
 e.play()
 g = e.generation
-e.stop()
-e.stop()
-check("R09 stop() 后再次 stop → 代次仍递增、不清零", e.generation == g + 2, f"{g}->{e.generation}")
+e.stop()          # 【F7】非阻塞：只置淡出意图并立即返回
+settle(e)         # 推进淡出 + poll() 收尾
+g1 = e.generation
+check("R09 stop()（settle 后）→ 代次 +1、不清零", g1 == g + 1, f"{g}->{g1}")
+e.stop()          # 已 STOPPED → 立即完成
+settle(e)
+check("R09 再次 stop → 代次再 +1", e.generation == g1 + 1, f"{g1}->{e.generation}")
 e._generation = 2 ** 70
 e.stop()
 check("R09 大数仍正常 +1（非定长，防 ABA）", e.generation == 2 ** 70 + 1, str(e.generation))
@@ -225,6 +248,7 @@ e.play()
 _ = next(e._stream)
 EVENTS.clear()
 e.stop()
+settle(e)   # 【F7】淡出走完 + poll() 收尾后才 device.stop() + 关解码器
 check("R10 顺序：先 device.stop() 再关解码器", EVENTS[:2] == ["device.stop", "raw.close"], str(EVENTS))
 
 paths_hit = {}
@@ -256,6 +280,7 @@ for label, action in (
         BACKEND["mode"] = "ok"
     else:
         action(e)
+        settle(e)   # 【F7】stop/pause 的收尾发生在 settle 之后
     paths_hit[label] = calls["n"]
 check("R11 六条路径都收敛到 _close_decoder", all(v >= 1 for v in paths_hit.values()), str(paths_hit))
 check("R11 关闭后无残留流（各路径 _stream 为 None）", e._stream is None, str(e._stream))
@@ -265,6 +290,7 @@ e.load(A)
 e.play()
 old = e._stream
 e.stop()
+settle(e)   # 【F7】先让淡出跑完并收尾
 check("R12 关闭后原生成器 next() 抛 StopIteration", exhausted(old))
 n0 = e._device.started
 e.play()

@@ -60,7 +60,6 @@ FADE_IN_MS = 200.0            # 淡入时长
 FADE_OUT_MS = 300.0           # 淡出时长
 VOLUME_SMOOTH_MS = 80.0       # 音量平滑时间常数（50~100ms）
 SEEK_FADE_SKIP_MS = 100.0     # seek 跳跃 < 此值视为"短跳"：跳过 ramp-out（内容几乎连续）
-_FADE_MARGIN = 0.005          # 等待淡出走完的额外余量（秒）
 _DEFAULT_VOLUME = 0.8
 
 
@@ -117,7 +116,10 @@ class AudioEngine:
         self._resume_gain = 0.0
         self._muted = False
         self._gain_changed_at = 0.0                       # 目标变更时间戳
-        self._fading_out = False                          # 淡出期间抑制 finished
+        # 【F7】淡出意图与终局：控制路径只置位，淡出由 PCM 层推进，poll() 收尾
+        self._fade_intent: str | None = None              # None | "pause" | "stop"
+        self._pending_finalize: str | None = None         # 音频线程置位、poll() 消费
+        self._handoff_gain = 0.0                          # 新流淡入的接管起点
 
         # ---- 代次号 ----
         self._generation = 0
@@ -147,7 +149,9 @@ class AudioEngine:
         except Exception as exc:  # noqa: BLE001
             raise _fail(ErrorCode.FILE_CORRUPT, f"解码器打不开这个文件：{exc}") from exc
         # 切歌路径：旧流淡出（stop 内部完成）→ 关旧解码器 → 新流随后淡入
-        self.stop()
+        # 【F7】切歌 = 中断接管：取消活跃淡出 → 立刻切流（不等待淡出走完）
+        self._handoff_gain = self._cancel_fade()
+        self._stop_now()
         with self._lock:
             self._path = path
             self._duration = float(info.duration or 0.0)
@@ -172,7 +176,10 @@ class AudioEngine:
             elif self._state is State.PAUSED:
                 start_frame, start_gain = self._frames_played, self._resume_gain
             else:
-                start_frame, start_gain = self._frames_played, 0.0
+                # 【F7】从 STOPPED 起播：若刚发生过中断接管，则从接管点续接增益
+                # 注意：此处已持锁，直接读写 _handoff_gain（_take_handoff 会再次加锁 → 死锁）
+                start_frame, start_gain = self._frames_played, self._handoff_gain
+                self._handoff_gain = 0.0
             self._generation += 1
             self._frames_played = start_frame
             self._pending_finished = False
@@ -181,23 +188,19 @@ class AudioEngine:
         self._start_stream(start_frame, start_gain)
 
     def pause(self) -> None:
-        """淡出（期间 state 仍 PLAYING）→ 淡出走完 → device.stop() + 关解码器 → PAUSED。
+        """【F7 非阻塞】只置「淡出意图」并立即返回；淡出由 PCM 层推进。
 
-        【F4】若暂停发生在淡入**进行中**，冻结当时的增益作为恢复起点
-        （淡入已完成时恢复点仍为 0，保证正常的淡入听感）。
+        淡出期间 state 仍为 PLAYING（B4：UI 按钮不提前跳变）；
+        淡出走完 → poll() 里 device.stop() → _close_decoder() → PAUSED。
+        【F4】若暂停发生在淡入进行中，冻结当时增益作为恢复起点。
         """
         with self._lock:
             if self._state is not State.PLAYING or self._device is None:
                 return
             self._resume_gain = 0.0 if self._fade.is_done else self._fade.current_gain
-            self._fading_out = True
+            self._fade_intent = "pause"
             self._fade.reset(0.0, self._fade_out_ms)
-        self._wait_fade_out()
-        self._device.stop()
-        self._close_decoder()
-        with self._lock:
-            self._state = State.PAUSED
-            self._fading_out = False
+        # 立即返回，不 sleep、不 join、不 while 等待
 
     def toggle(self) -> None:
         if self.state == State.PLAYING.value:
@@ -206,17 +209,21 @@ class AudioEngine:
             self.play()
 
     def stop(self) -> None:
-        """旧流淡出 → 淡出走完 → device.stop() + _close_decoder() → STOPPED。"""
+        """【F7 非阻塞】有活跃流 → 只置淡出意图并立即返回；否则立即完成。
+
+        淡出走完 → poll() 里 device.stop() → _close_decoder() → STOPPED + 代次 +1。
+        """
         with self._lock:
-            was_active = self._state is State.PLAYING and self._stream is not None
-            if was_active:
-                self._fading_out = True
+            if self._state is State.PLAYING and self._stream is not None:
+                self._fade_intent = "stop"
                 self._fade.reset(0.0, self._fade_out_ms)
-        if was_active:
-            self._wait_fade_out()
-        with self._lock:
-            self._generation += 1     # 淡出之后才失效代次（淡出本身仍需产出音频）
-            self._fading_out = False
+                return  # 立即返回
+        self._stop_now()
+
+    def _stop_now(self) -> None:
+        """立即停止（不淡出）：device.stop() → _close_decoder() → STOPPED。"""
+        self._fade_intent = None
+        self._pending_finalize = None
         if self._device is not None:
             try:
                 self._device.stop()
@@ -224,10 +231,34 @@ class AudioEngine:
                 pass
         self._close_decoder()
         with self._lock:
+            self._generation += 1
             self._state = State.STOPPED
             self._frames_played = 0
             self._pending_finished = False
             self._pending_error = False
+
+    def _finalize_fade_out(self, intent: str) -> None:
+        """【F7】淡出完成后的收尾（仅主线程 poll() 调用）。
+
+        顺序严格保持「先 device.stop() → 再 _close_decoder()」（R10），
+        且只执行一次（_pending_finalize 已被 poll 消费，天然幂等）。
+        """
+        if self._device is not None:
+            try:
+                self._device.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self._close_decoder()
+        with self._lock:
+            self._generation += 1
+            self._pending_finished = False
+            self._pending_error = False
+            if intent == "stop":
+                self._frames_played = 0
+                self._state = State.STOPPED
+            else:  # pause
+                self._state = State.PAUSED
+        logger.debug("fade-out finalized: %s", intent)
 
     def seek(self, seconds: float) -> None:
         """取消淡出，在新位置启动淡入。
@@ -253,21 +284,24 @@ class AudioEngine:
             self._frames_played = frame
             self._pending_finished = False
             self._fade.reset(1.0, self._fade_in_ms)  # 取消任何进行中的淡出，改为新位置淡入
+        handoff = self._cancel_fade()  # 【F7】取消活跃淡出并取得接管增益
         if was_playing and self._device is not None:
-            if need_ramp:
-                time.sleep(_FADE_MARGIN + 0.015)  # 等一个 chunk 的 ramp-out 尾巴
             self._device.stop()
             self._close_decoder()
-            self._start_stream(frame, 0.0)
+            self._start_stream(frame, handoff if need_ramp else 0.0)
 
     def poll(self) -> None:
         """主线程调用：消费音频线程的一次性事件并触发回调（唯一事件出口）。"""
         with self._lock:
+            finalize = self._pending_finalize
+            self._pending_finalize = None
             finished = self._pending_finished
             self._pending_finished = False
             errored = self._pending_error
             self._pending_error = False
             code, msg = self._error_code, self._error_msg
+        if finalize is not None:
+            self._finalize_fade_out(finalize)  # 【F7】淡出完成收尾
         if finished or errored:
             if self._device is not None:
                 try:
@@ -276,6 +310,9 @@ class AudioEngine:
                     pass
             self._close_decoder()
         if errored:
+            with self._lock:
+                self._fade_intent = None  # 【B2】error 立即接管，不等淡出
+                self._pending_finalize = None
             # 【约束2】日志只在主线程写：音频回调里不做任何可能阻塞的 IO。
             logger.error(
                 "decode error code=%s detail=%s",
@@ -317,9 +354,9 @@ class AudioEngine:
 
     def shutdown(self) -> None:
         """跳过淡出，直接关（退出路径不拖时间）。"""
+        self._cancel_fade()  # 【B3】跳过一切淡出
         with self._lock:
             self._generation += 1
-            self._fading_out = False
         if self._device is not None:
             try:
                 self._device.stop()
@@ -360,6 +397,12 @@ class AudioEngine:
     @property
     def seek_fade_skip_ms(self) -> float:
         return self._seek_fade_skip_ms
+
+    @property
+    def fade_pending(self) -> bool:
+        """是否正在淡出（控制路径已返回、但设备尚未停）。"""
+        with self._lock:
+            return self._fade_intent is not None
 
     @property
     def target_gain(self) -> float:
@@ -413,8 +456,32 @@ class AudioEngine:
             )
 
     # ══════════ 内部 ══════════
-    def _wait_fade_out(self) -> None:
-        time.sleep(self._fade_out_ms / 1000.0 + _FADE_MARGIN)
+    def _cancel_fade(self) -> float:
+        """【F7】取消活跃淡出并返回**接管增益**（供新流淡入起点）。
+
+        不变式：新流创建时，若存在活跃淡出，立即 cancel 它，
+        并从 envelope.current_gain 起跳启动新流的淡入——第 N 次点击不排队等前 N-1 次。
+        """
+        with self._lock:
+            # 顺序关键：必须在 cancel() 之前读取当前增益——cancel() 会把 current 清零，
+            # 若先 cancel 再取，接管点会退化成 0，新流就从静音起跳（"吸气感"）。
+            gain = self._effective_gain_locked()
+            had_intent = self._fade_intent is not None
+            self._fade_intent = None
+            self._pending_finalize = None
+            if had_intent:
+                self._fade.cancel()
+            return gain
+
+    def _effective_gain_locked(self) -> float:
+        """当前有效增益 = smooth × fade（调用方须已持锁或接受短暂不一致）。"""
+        return max(0.0, min(1.0, self._smooth_gain * self._fade.current_gain))
+
+    def set_fade(self, fade_in_ms: float, fade_out_ms: float) -> None:
+        """【C2】运行期调整淡入淡出时长；引擎只认毫秒数，不认业务概念。"""
+        with self._lock:
+            self._fade_in_ms = max(0.0, float(fade_in_ms))
+            self._fade_out_ms = max(0.0, float(fade_out_ms))
 
     def _ensure_device(self) -> None:
         if self._device is None:
@@ -456,7 +523,7 @@ class AudioEngine:
 
     def _on_finished(self, generation: int) -> None:
         with self._lock:
-            if generation != self._generation or self._fading_out:
+            if generation != self._generation or self._fade_intent is not None:
                 return  # 旧代次 / 正在淡出 → 丢弃
             if self._state is not State.PLAYING:
                 return
@@ -591,7 +658,20 @@ class AudioEngine:
                     eof_fade_started = True
                 out = self._apply_gain_envelope(chunk, frames, generation)
                 abs_pos += frames
+                # 【F7】淡出完成检测：由音频线程置位，主线程 poll() 收尾
+                finalize = None
+                with self._lock:
+                    if (
+                        self._fade_intent is not None
+                        and self._fade.is_done
+                        and self._fade.current_target <= 0.0
+                    ):
+                        finalize = self._fade_intent
+                        self._fade_intent = None
+                        self._pending_finalize = finalize
                 yield out
+                if finalize is not None:
+                    return  # 淡出已走完：结束本流，等 poll() 停设备 + 关解码器
         except Exception as exc:  # noqa: BLE001
             # 只捕获 Exception（不捕获 GeneratorExit）；音频线程内不打日志（约束2）
             self._on_error(generation, ErrorCode.FILE_CORRUPT, str(exc))
