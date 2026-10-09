@@ -169,17 +169,21 @@ class AudioEngine:
         self._start_stream(start_frame, start_gain)
 
     def pause(self) -> None:
-        """淡出（期间 state 仍 PLAYING）→ 淡出走完 → device.stop() + 关解码器 → PAUSED。"""
+        """淡出（期间 state 仍 PLAYING）→ 淡出走完 → device.stop() + 关解码器 → PAUSED。
+
+        【F4】若暂停发生在淡入**进行中**，冻结当时的增益作为恢复起点
+        （淡入已完成时恢复点仍为 0，保证正常的淡入听感）。
+        """
         with self._lock:
             if self._state is not State.PLAYING or self._device is None:
                 return
+            self._resume_gain = 0.0 if self._fade.is_done else self._fade.current_gain
             self._fading_out = True
             self._fade.reset(0.0, FADE_OUT_MS)
         self._wait_fade_out()
         self._device.stop()
         self._close_decoder()
         with self._lock:
-            self._resume_gain = 0.0
             self._state = State.PAUSED
             self._fading_out = False
 
