@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          # PySide6-Essentials：只需 QtCore/QtWidgets，避免拉入数百 MB 的 Addons
+          pip install PySide6-Essentials pytest pytest-cov
+
+      - name: 引擎测试（无需 Qt，也不需要显示器）
+        run: pytest -m engine -v --tb=short
+
+      - name: Qt 测试（offscreen 无头）
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -m qt -v --tb=short
+
+      - name: 回归套件（每轮必须绿）
+        run: pytest -m regression -v --tb=short
+
+      - name: 覆盖率报告（不设门控）
+        if: matrix.python-version == '3.11'
+        run: pytest -m engine --cov=src/player --cov-report=term-missing

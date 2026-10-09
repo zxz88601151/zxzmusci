@@ -42,6 +42,8 @@ import _audio_stub  # noqa: E402
 # 因此所有套件必须用同一个替身（差异只体现在 configure() 的参数上），
 # 否则后加载的套件会拿到先加载套件的后端。
 _audio_stub.install()
+
+pytestmark = pytest.mark.qt
 BACKEND = _audio_stub.BACKEND
 EVENTS = _audio_stub.EVENTS
 CLOSES = _audio_stub.CLOSES
