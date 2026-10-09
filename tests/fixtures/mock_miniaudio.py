@@ -46,12 +46,16 @@ IOError = IOError_  # noqa: A001
 
 FAULTS = {"DECODE_ERROR", "IO_ERROR", "DEVICE_ERROR"}
 
+# 替身"解码器"认得的扩展名。真实 miniaudio 会对不支持的格式报错，
+# 替身也照做——否则 M3「非法路径抛 DecodeError」无从验证。
+SUPPORTED_EXTS = (".mp3", ".wav", ".flac", ".ogg", ".opus", ".m4a")
+
 DEFAULTS = {
     "duration": 5.0,          # get_file_info().duration
     "chunks": 50,             # stream_file 产出多少段
     "frames_per_chunk": 2000,  # 每段帧数
     "amplitude": 10000,       # PCM 幅值（16bit）
-    "mode": "ok",             # "ok" | "error"（error = 中途抛 DecodeError）
+    "mode": "ok",             # "ok" | "decode_error" | "io_error"
     "start_fault": None,      # None | "DEVICE_ERROR"
 }
 
@@ -99,6 +103,11 @@ class FakeDevice:
     def close(self):
         pass
 
+    @property
+    def is_running(self) -> bool:
+        """替身设备没有后台线程：start 后处于"可被拉取"状态，stop 后不可。"""
+        return self.gen is not None
+
 
 class _FileInfo:
     def __init__(self, duration):
@@ -108,14 +117,24 @@ class _FileInfo:
 
 
 def _stream_file(path, **kw):
-    """stream_file 替身：产出 16bit 立体声 PCM，支持中途故障注入。"""
+    """stream_file 替身：产出 16bit 立体声 PCM，支持中途故障注入。
+
+    故障语义（M3/M4）：
+    - 扩展名不在 SUPPORTED_EXTS → 立即抛 DecodeError（模拟"打不开"）
+    - mode == "decode_error"     → 产出 1 段后抛 DecodeError（模拟中途损坏）
+    - mode == "io_error"         → 产出 1 段后抛 IOError（模拟读盘中断）
+    """
     try:
-        if BACKEND["mode"] == "error":
-            amp = BACKEND["amplitude"]
+        if not str(path).lower().endswith(SUPPORTED_EXTS):
+            raise DecodeError(f"Unsupported format: {path}")
+        amp = BACKEND["amplitude"]
+        mode = BACKEND["mode"]
+        if mode in ("decode_error", "io_error", "error"):
             yield array.array("h", [amp, amp])
+            if mode == "io_error":
+                raise IOError_("Simulated IO error during read")
             raise DecodeError("boom: 文件损坏")
         n = BACKEND["frames_per_chunk"]
-        amp = BACKEND["amplitude"]
         for _ in range(BACKEND["chunks"]):
             yield array.array("h", [amp, amp] * n)
     finally:
@@ -155,10 +174,14 @@ def install() -> None:
 
 def set_fault(name: str) -> None:
     """故障注入：DECODE_ERROR / IO_ERROR / DEVICE_ERROR。"""
+    if name not in FAULTS:
+        raise ValueError(f"unknown fault: {name}")
     if name == "DEVICE_ERROR":
         BACKEND["start_fault"] = "DEVICE_ERROR"
+    elif name == "IO_ERROR":
+        BACKEND["mode"] = "io_error"
     else:
-        BACKEND["mode"] = "error"
+        BACKEND["mode"] = "decode_error"
 
 
 def clear_fault() -> None:
