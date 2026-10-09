@@ -70,10 +70,26 @@
 
 ### CI 守卫（第 6 步）
 
-`.github/workflows/ci.yml` 新增守卫 step：**Qt 用例"收集到但全 skipped"= 假绿，直接 fail**。
-本机四象限验证：无 PySide6 → FAIL；收集到但全 skip → FAIL；有通过项 → PASS；全收集失败 → FAIL。
-（原稿守卫有 2 处真 bug：`grep -cE '^tests[/\\].*::test_'` 在 headless 下恒为 0 使守卫**永不触发**；
-`grep -c` 非零退出泄漏换行致 `[: integer expected`。已修为 `grep -cE '^tests'` + 显式 `TOTAL<=0` 判空。）
+`.github/workflows/ci.yml` 新增守卫：**Qt 用例"收集到但全 skipped"= 假绿，直接 fail**。
+
+**三次返工的真实教训**（都记下来了，避免复现）：
+
+| 轮次 | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| run#3 | GitHub 端 **0 秒失败**、check_run 数=0、无 job | `- name: Guard: ...` 的**裸冒号**使整个 workflow YAML 语法错误 | name 加双引号 |
+| run#4/#5 | workflow 能跑，守卫在 3.12/3.11 误报 FAIL | ① `-q` 在"只 skip 无 passed"时不打印汇总行；② grep 字符类 `[A-Za-z0-9_\[\]-]` 连排导致**整类失效** | 改 `-v` + 数逐条结果行 |
+| run#6 | 同上，仍未根治 | **heredoc 写进 YAML 块标量的缩进陷阱**（本地 PyYAML 报 `could not find expected ':'`） | **逻辑外置** |
+
+**最终方案**：判据抽成 `tests/ci_qt_guard.py`（纯函数，可本地单测），
+读 `--junitxml`（pytest 官方稳定契约）判定 `tests<=0 / failed>0 / passed<=0`。
+workflow 只留 8 行 shell，YAML 内零 heredoc、零文本解析。
+
+本地五象限验证：无 Qt（收集期 skip）→FAIL ✅ / 无 junitxml→FAIL ✅ /
+3 全通过→PASS ✅ / 1 失败→FAIL ✅ / 收集 0 条→FAIL ✅。
+
+⚠️ 另有两处**用户原稿守卫的真 bug**（一并修掉）：
+`grep -cE '^tests[/\\].*::test_'` 在 headless 下恒为 0 使守卫**永不触发**；
+`grep -c` 非零退出的换行污染导致 `[: integer expected`。
 
 ---
 
