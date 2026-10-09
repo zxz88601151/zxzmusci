@@ -66,6 +66,7 @@ class MainWindow(QMainWindow):
         self.engine = AudioEngine()
         self._seeking = False  # 用户正在拖进度条时，不让 timer 回写
         self._error_dialog_open = False  # 【P1-1】防止同一失败重复弹窗
+        self._ui_generation = -1  # 【P1-2】UI 当前展示的流代次
 
         # 【P0-1/P0-3】订阅引擎事件：由 _refresh -> engine.poll() 在主线程触发。
         self.engine.on_finished = self._on_engine_finished
@@ -217,13 +218,23 @@ class MainWindow(QMainWindow):
     def _refresh(self) -> None:
         # 【P0-3/P1-7】先消费音频线程的一次性事件（错误/结束），再刷新 UI。
         self.engine.poll()
-        dur = self.engine.duration
-        pos = self.engine.position
+        # 【P1-2】一次性取一致快照，杜绝"旧歌的 position 配新歌的 duration / 标题"。
+        generation, pos, dur, _state = self.engine.snapshot()
+        if generation != self._ui_generation:
+            self._ui_generation = generation
+            self._refresh_track_label()
         if dur > 0 and not self._seeking:
             self.seek.setValue(int(pos / dur * 1000))
         self.time_label.setText(f"{_fmt(pos)} / {_fmt(dur)}")
         # 【P0-1】state 已是纯只读，直接同步按钮即可（含 finished / error）。
         self._sync_play_button()
+
+    def _refresh_track_label(self) -> None:
+        # 【P1-2】标题只从"当前代次对应的曲目"派生，迟到回调无法污染。
+        path = self.engine.current_path
+        self.track_label.setText(
+            os.path.basename(path) if path else "未加载音频 — 点「打开」选一首歌"
+        )
 
     def _sync_play_button(self) -> None:
         text = "暂停" if self.engine.state == "playing" else "播放"
