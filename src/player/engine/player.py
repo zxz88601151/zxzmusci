@@ -16,11 +16,22 @@
   关闭顺序固定「先 device.stop() → 再 _close_decoder()」，杜绝孤儿流。
 
 【P1-2 / P1-3 修复 · generation 代次号】
-- `_generation` 单调递增（Python int，无溢出），**永不清零**（避免 ABA）。
+- `_generation` 单调递增（Python int，无溢出），永不清零（避免 ABA）。
 - 真正生效的 play / seek / load / stop 各递增 1 次；被守卫挡回的 play() 不递增。
-- `_pcm_stream` 在创建时快照自己的代次号；进度累加、EOF、错误三类事件
-  **全部在锁内做「代次校验 + 应用」的原子操作**，代次不匹配一律静默丢弃（不抛异常）。
-- 因此：旧代次的进度/EOF/错误既不污染新流的位置与状态，也不会触发 finished / 切歌。
+- 所有进度 / EOF / 错误事件在锁内做「代次校验 + 应用」的原子操作，代次不匹配静默丢弃。
+
+【P1-4 修复 · 感知音量曲线】
+- 滑块值 → 增益用**平方律** `gain = v²`（v=0 静音、v=1 满音量），替代原线性映射。
+- 取整改 `round()`（不再向零截断），并钳位到 [-32768, 32767]。
+- 增益计算抽成 `_apply_gain()` 纯函数，便于单测。
+
+【P1-5 修复 · 淡入淡出】
+- 增益带**平滑 ramp**：`_gain_now` 以 `_FADE_SAMPLES` 为步长逼近 `_gain_target`。
+- 流启动时 `_gain_now=0` → 自动淡入；音量变化也被平滑（消 zipper noise）。
+- 流尾 `_FADE_SAMPLES` 内强制 ramp-out（自然播完不爆音）。
+- pause：把 `_gain_target` 置 0 并等 ramp 走完再停设备。
+- stop / seek：代次失效时，本流最后一段做**快速 ramp-out** 后结束（不计数、不触发事件），
+  既保证旧代次回调被丢弃，又避免硬切爆音。
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ import array
 import logging
 import os
 import threading
+import time
 from collections.abc import Iterator
 from typing import Callable
 
@@ -46,6 +58,30 @@ _SAMPLE_RATE = 44100
 _NCHANNELS = 2
 _PCM_MIN = -32768
 _PCM_MAX = 32767
+
+# 【P1-5】淡入淡出参数
+_FADE_MS = 15
+_FADE_SAMPLES = max(1, int(_SAMPLE_RATE * _FADE_MS / 1000))
+_FADE_MARGIN = 0.005  # 等 ramp 走完的额外余量（秒）
+
+
+def _clamp_pcm(v: float) -> int:
+    """钳位到 16bit 有符号范围。"""
+    if v < _PCM_MIN:
+        return _PCM_MIN
+    if v > _PCM_MAX:
+        return _PCM_MAX
+    return int(v)
+
+
+def perceptual_gain(v: float) -> float:
+    """【P1-4】滑块值 → 感知增益（平方律）。
+
+    v=0 → 0（静音），v=0.5 → 0.25，v=1 → 1（满音量）。
+    比线性映射更接近人耳响度感知，也避免"低音量区间变化过猛"。
+    """
+    v = max(0.0, min(1.0, v))
+    return v * v
 
 
 class AudioError(Exception):
@@ -70,7 +106,10 @@ class AudioEngine:
         self._path: str | None = None
         self._duration = 0.0
         self._frames_played = 0  # 已播出的 PCM 帧数（含 seek 起点）
-        self._volume = 0.8
+        self._volume = 0.8  # 原始滑块值 [0,1]
+        # 【P1-4/P1-5】感知增益包络：now 平滑逼近 target
+        self._gain_now = 0.0
+        self._gain_target = perceptual_gain(0.8)
         self._state = State.STOPPED  # 【P0-1】状态枚举
         # 【P1-2/P1-3】代次号：每次"真正生效"的流生命周期操作 +1，永不清零
         self._generation = 0
@@ -138,11 +177,13 @@ class AudioEngine:
         self._start_stream(start_frame)
 
     def pause(self) -> None:
+        # 【P1-5】先请求淡出（不失效代次，让流继续产出并 ramp 到 0），等 ramp 走完再停设备。
         with self._lock:
             if self._state is not State.PLAYING or self._device is None:
                 return
             self._state = State.PAUSED
-        # 【P1-7】先停设备（等音频线程退出），再关生成器，杜绝孤儿流
+            self._gain_target = 0.0
+        time.sleep(_FADE_MS / 1000.0 + _FADE_MARGIN)
         self._device.stop()
         self._close_decoder()
 
@@ -155,9 +196,13 @@ class AudioEngine:
 
     def stop(self) -> None:
         with self._lock:
+            was_active = self._state is State.PLAYING and self._stream is not None
             # 【P1-2/P1-3】先递增代次：任何在途/迟到的旧回调立即失效。
             # 永不清零，避免 ABA（新流拿到与旧流相同的代次号）。
             self._generation += 1
+        if was_active and self._device is not None:
+            # 【P1-5】等旧流把最后一段的快速 ramp-out 吐出来再停设备（消爆音）。
+            time.sleep(_FADE_MS / 1000.0 + _FADE_MARGIN)
         if self._device is not None:
             try:
                 self._device.stop()
@@ -185,6 +230,8 @@ class AudioEngine:
             self._frames_played = frame
             self._pending_finished = False
         if was_playing and self._device is not None:
+            # 【P1-5】等旧流 ramp-out 尾巴吐完再停（代次已失效 → 尾巴不计数、不触发事件）。
+            time.sleep(_FADE_MS / 1000.0 + _FADE_MARGIN)
             self._device.stop()
             self._close_decoder()
             self._start_stream(frame)
@@ -214,7 +261,11 @@ class AudioEngine:
             self.on_error(code, msg)
 
     def set_volume(self, v: float) -> None:
-        self._volume = max(0.0, min(1.0, v))
+        # 【P1-4】记录原始滑块值，并把感知增益设为新的目标（由 ramp 平滑逼近）。
+        v = max(0.0, min(1.0, v))
+        with self._lock:
+            self._volume = v
+            self._gain_target = perceptual_gain(v)
 
     # ---------- 只读查询 ----------
     @property
@@ -286,14 +337,16 @@ class AudioEngine:
                 raise _fail(ErrorCode.DEVICE_NOT_FOUND, f"打不开声卡：{exc}") from exc
 
     def _start_stream(self, seek_frame: int) -> None:
-        """【P1-7/P1-2】创建新 PCM 生成器并交给设备；调用前旧流必须已关闭。
+        """【P1-7/P1-2/P1-5】创建新 PCM 生成器并交给设备；调用前旧流必须已关闭。
 
-        生成器创建时快照当前代次号，之后所有回调都以该代次号校验。
+        生成器创建时快照当前代次号；增益包络从 0 起步（自动淡入）。
         """
         self._close_decoder()
         assert self._device is not None
         with self._lock:
             generation = self._generation
+            self._gain_now = 0.0  # 淡入起点
+            self._gain_target = perceptual_gain(self._volume)
         stream = self._pcm_stream(seek_frame, generation)
         self._stream = stream
         self._device.start(stream)
@@ -337,8 +390,89 @@ class AudioEngine:
             self._error_msg = message
             self._pending_error = True
 
+    # ---------- PCM 增益 / 淡入淡出 ----------
+    @staticmethod
+    def _apply_gain(sample: int, gain: float) -> int:
+        """【P1-4】对单个 16bit 样本施加增益：四舍五入 + 钳位（不再向零截断）。"""
+        return _clamp_pcm(round(sample * gain))
+
+    @staticmethod
+    def _ramp_table(count: int, start: float, end: float) -> list[float]:
+        """【P1-5】预计算 count 个线性 ramp 系数（含 start 与 end 两端）。
+
+        注：提示词中的 `_ramp_table(duration_samples, sample_rate)` 语义已折叠为
+        `count = duration_ms * sample_rate / 1000`，由调用方按需换算后传入。
+        """
+        if count <= 0:
+            return []
+        if count == 1:
+            return [end]
+        step = (end - start) / (count - 1)
+        return [start + step * i for i in range(count)]
+
+    def _apply_envelope(
+        self, chunk: array.array, start_frame: int, frames: int, total_frames: int
+    ) -> array.array:
+        """【P1-4/P1-5】对一段 PCM 施加：感知增益 + 平滑 ramp + 流尾淡出。
+
+        - 平滑 ramp：`_gain_now` 每帧朝 `_gain_target` 逼近 1/_FADE_SAMPLES
+          → 流首自动淡入、音量变化无 zipper noise、pause 时淡出。
+        - 流尾淡出：最后 _FADE_SAMPLES 帧强制 ramp 到 0。
+        """
+        n = _NCHANNELS
+        with self._lock:
+            gain_now = self._gain_now
+            gain_target = self._gain_target
+        tail_start = (total_frames - _FADE_SAMPLES) if total_frames > 0 else None
+        tail_active = tail_start is not None and (start_frame + frames) > tail_start
+
+        # 快速路径：满音量且本段不涉及淡入/淡出 → 原样返回
+        if gain_now >= 1.0 and gain_target >= 1.0 and not tail_active and start_frame >= _FADE_SAMPLES:
+            return chunk
+
+        step = (gain_target - gain_now) / _FADE_SAMPLES
+        apply = self._apply_gain
+        out = array.array("h")
+        append = out.append
+        for i in range(frames):
+            if gain_now != gain_target:
+                gain_now = (
+                    gain_target if abs(gain_target - gain_now) <= abs(step) else gain_now + step
+                )
+            g = gain_now
+            if tail_active:
+                pos = start_frame + i
+                if pos >= tail_start:
+                    # 在 total_frames-1（最后一帧）精确归零
+                    g *= max(0.0, (total_frames - 1 - pos) / max(1, _FADE_SAMPLES - 1))
+            base = i * n
+            for c in range(n):
+                append(apply(chunk[base + c], g))
+        with self._lock:
+            self._gain_now = gain_now
+        return out
+
+    def _ramp_out_chunk(self, chunk: array.array) -> array.array:
+        """【P1-5】代次失效时对最后一段做快速 ramp-out（从当前增益降到 0）。"""
+        n = _NCHANNELS
+        frames = len(chunk) // n
+        with self._lock:
+            start = self._gain_now
+        table = self._ramp_table(frames, start, 0.0)
+        apply = self._apply_gain
+        out = array.array("h")
+        append = out.append
+        for i in range(frames):
+            g = table[i]
+            base = i * n
+            for c in range(n):
+                append(apply(chunk[base + c], g))
+        with self._lock:
+            self._gain_now = 0.0
+        return out
+
     def _pcm_stream(self, seek_frame: int, generation: int):
-        """包一层：计数已播帧、软件音量、显式结束/错误事件。device 在独立线程里拉它。
+        """包一层：计数已播帧、增益包络、显式结束/错误事件。device 在独立线程里拉它。
 
         【P1-2/P1-3】`generation` 是本流创建时的代次号快照；所有对引擎状态的写入
         都必须先校验代次是否仍然有效，否则一律丢弃。
@@ -352,21 +486,23 @@ class AudioEngine:
                 sample_rate=_SAMPLE_RATE,
                 seek_frame=seek_frame,
             )
+            total_frames = int(self._duration * _SAMPLE_RATE) if self._duration > 0 else 0
+            abs_pos = seek_frame
             for chunk in raw:  # chunk: array('h')
                 frames = len(chunk) // _NCHANNELS
                 with self._lock:
-                    # 「快照校验 + 应用」在同一把锁内原子完成：
-                    # 校验与写入之间不可能被其它线程插入代次变更。
-                    if generation != self._generation:
-                        return  # 代次已变（seek/load/stop/play）→ 本流立即终止，不再产出
-                    self._frames_played += frames
-                vol = self._volume
-                if vol < 1.0:
-                    chunk = array.array(
-                        "h",
-                        (max(_PCM_MIN, min(_PCM_MAX, int(s * vol))) for s in chunk),
-                    )
-                yield chunk
+                    # 「快照校验 + 应用」在同一把锁内原子完成。
+                    stale = generation != self._generation
+                    if not stale:
+                        self._frames_played += frames
+                if stale:
+                    # 【P1-5】代次已变（seek/load/stop）→ 本段做快速 ramp-out 后终止：
+                    # 不计数、不产出后续、不触发 finished/error，仅消除硬切爆音。
+                    yield self._ramp_out_chunk(chunk)
+                    return
+                out = self._apply_envelope(chunk, abs_pos, frames, total_frames)
+                abs_pos += frames
+                yield out
         except Exception as exc:  # noqa: BLE001
             # 【P0-3】只捕获 Exception（不捕获 GeneratorExit），异常绝不穿出到音频线程。
             logger.error("decode error: %s", exc)
