@@ -1,5 +1,20 @@
-"""Phase 0 最小主窗口：打开文件、播/停、进度条、音量。"""
+"""Phase 0 最小主窗口：打开文件、播/停、进度条、音量。
 
+【P1-1 修复 · UI 异常统一】
+- 所有槽函数经 `@guard_audio` 包裹：引擎异常一律汇入 `_on_error(code, msg)`，
+  不再有散落的 try/except + 各自弹窗。
+- 运行期错误（解码 / IO）由 `engine.poll()` → `on_error` 回调进入同一入口。
+- `_on_error` 是 UI 侧**唯一**错误出口，负责三件事：
+  1. 按 ErrorCode 映射人话文案（**不露堆栈**）；
+  2. 写错误码日志（`code=...`）；
+  3. 区分「可重试」与「不可恢复」两类，可重试时提供「重试」按钮。
+- 用 `_error_dialog_open` 保证同一次失败**只弹一次**。
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
 import os
 
 from PySide6.QtCore import Qt, QTimer
@@ -15,12 +30,31 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from player.engine.player import AudioEngine
+from player.engine.player import AudioEngine, AudioError
+from player.engine.states import ErrorCode
+from player.ui.error_text import describe
+
+logger = logging.getLogger(__name__)
 
 
 def _fmt(sec: float) -> str:
     sec = max(0, int(sec))
     return f"{sec // 60}:{sec % 60:02d}"
+
+
+def guard_audio(slot):
+    """【P1-1】统一包裹槽函数：任何引擎异常都汇入 self._on_error，绝不穿出 Qt 槽。"""
+
+    @functools.wraps(slot)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return slot(self, *args, **kwargs)
+        except AudioError as exc:
+            self._on_error(exc.code, str(exc))
+        except Exception as exc:  # noqa: BLE001 - 兜底
+            self._on_error(ErrorCode.UNKNOWN, str(exc))
+
+    return wrapper
 
 
 class MainWindow(QMainWindow):
@@ -31,6 +65,7 @@ class MainWindow(QMainWindow):
 
         self.engine = AudioEngine()
         self._seeking = False  # 用户正在拖进度条时，不让 timer 回写
+        self._error_dialog_open = False  # 【P1-1】防止同一失败重复弹窗
 
         # 【P0-1/P0-3】订阅引擎事件：由 _refresh -> engine.poll() 在主线程触发。
         self.engine.on_finished = self._on_engine_finished
@@ -89,7 +124,8 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._refresh)
         self.timer.start()
 
-    # --- 事件 ---
+    # --- 事件（统一经 guard_audio 包裹）---
+    @guard_audio
     def _on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -99,31 +135,87 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        try:
-            self.engine.load(path)
-        except Exception as exc:  # noqa: BLE001 - 播放失败要弹人话
-            QMessageBox.warning(self, "打不开", f"这个文件播不了，已跳过：\n{exc}")
-            return
+        self.engine.load(path)  # 失败 → guard_audio → _on_error
         self.track_label.setText(os.path.basename(path))
         self.engine.play()
         self._sync_play_button()
 
+    @guard_audio
     def _on_play_pause(self) -> None:
         self.engine.toggle()
         self._sync_play_button()
 
+    @guard_audio
     def _on_stop(self) -> None:
         self.engine.stop()
         self._sync_play_button()
 
+    @guard_audio
     def _on_seek_released(self) -> None:
         self._seeking = False
         dur = self.engine.duration
         if dur > 0:
             self.engine.seek(self.seek.value() / 1000.0 * dur)
 
+    # --- 引擎事件（主线程，由 poll() 触发）---
+    def _on_engine_finished(self) -> None:
+        # 【P0-1】自然播完。Phase 1 将在此自动切下一首；P0 只同步 UI。
+        self._sync_play_button()
+
+    def _on_engine_error(self, code, message) -> None:
+        # 【P1-1】运行期错误与 load 错误进入同一入口。
+        self._on_error(code, message)
+
+    # --- 唯一错误出口 ---
+    def _on_error(self, code: ErrorCode | None, message: str = "") -> None:
+        """【P1-1】UI 侧唯一错误入口：映射文案 + 错误码日志 + 可重试分流。"""
+        code = code or ErrorCode.UNKNOWN
+        # 日志始终带 ErrorCode（原始 message 只进日志，不进 UI 文案）
+        logger.error("UI error code=%s detail=%s", code.value, message)
+        self._sync_play_button()
+
+        if self._error_dialog_open:  # 同一次失败只弹一次
+            return
+
+        report = describe(code)
+        self._error_dialog_open = True
+        try:
+            retry = self._show_error_dialog(report)
+        finally:
+            self._error_dialog_open = False
+
+        if retry:
+            self._retry_play()
+
+    def _show_error_dialog(self, report) -> bool:
+        """弹出统一错误对话框；返回用户是否选择「重试」。"""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("播放出错")
+        box.setText(report.text)  # 固定文案，不含堆栈
+        if report.retryable:
+            box.setInformativeText("可稍后重试。")
+            box.setStandardButtons(QMessageBox.Retry | QMessageBox.Cancel)
+            box.setButtonText(QMessageBox.Retry, "重试")
+            box.setButtonText(QMessageBox.Cancel, "取消")
+            return box.exec() == QMessageBox.Retry
+        box.setInformativeText("该文件无法播放。")
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
+        return False
+
+    def _retry_play(self) -> None:
+        """用户点「重试」：重新尝试播放当前曲目（同样经统一错误入口）。"""
+        try:
+            self.engine.play()
+        except AudioError as exc:
+            self._on_error(exc.code, str(exc))
+        except Exception as exc:  # noqa: BLE001
+            self._on_error(ErrorCode.UNKNOWN, str(exc))
+
+    # --- 刷新 ---
     def _refresh(self) -> None:
-        # 【P0-3】先消费音频线程的一次性事件（错误/结束），再刷新 UI。
+        # 【P0-3/P1-7】先消费音频线程的一次性事件（错误/结束），再刷新 UI。
         self.engine.poll()
         dur = self.engine.duration
         pos = self.engine.position
@@ -137,16 +229,6 @@ class MainWindow(QMainWindow):
         text = "暂停" if self.engine.state == "playing" else "播放"
         if self.btn_play.text() != text:  # 避免每 250ms 无谓重绘
             self.btn_play.setText(text)
-
-    # --- 引擎事件（主线程，由 poll() 触发）---
-    def _on_engine_finished(self) -> None:
-        # 【P0-1】自然播完。Phase 1 将在此自动切下一首；P0 只同步 UI。
-        self._sync_play_button()
-
-    def _on_engine_error(self, code, message) -> None:
-        # 【P0-3】运行期解码/IO 错误：恢复按钮状态并给出人话提示。
-        self._sync_play_button()
-        QMessageBox.warning(self, "播放出错", f"这个文件播不下去了：\n{message}")
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.engine.shutdown()

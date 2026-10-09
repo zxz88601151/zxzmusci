@@ -6,12 +6,21 @@
 - seek：重建 stream 并指定 seek_frame（miniaudio 原生支持）。
 - ffmpeg 管道格式（m4a/alac/ape/wma/mp4）在 Phase 1 接入，当前遇到会报人话错误。
 
-【本轮 P0 修复】
+【P0 修复】
 - P0-1：`state` 改为纯只读属性（删除副作用）；新增 FINISHED 状态替代 `_eof` 幽灵标志；
         生成器正常耗尽时由音频线程调用 `_on_finished()` 显式转移，主线程 `poll()` 消费并回调。
 - P0-2：`play()` 守卫改用状态枚举，播完 / 出错后再次 `play()` 能正确重播，不再静默 return。
-- P0-3：`_pcm_stream` 用 try/except 捕获解码异常并转入 ERROR 状态，异常不再穿出到音频线程；
-        finally 中关闭底层解码器生成器；新增 ErrorCode 枚举。
+- P0-3：`_pcm_stream` 捕获解码异常并转入 ERROR 状态，异常不再穿出到音频线程。
+
+【P1-7 修复 · 解码器生命周期】
+- 引擎持有 `_stream`（当前 PCM 生成器）引用；所有停止路径（stop / pause / seek / load /
+  错误清理 / shutdown）都汇聚到同一个 `_close_decoder()`。
+- 关闭顺序统一为「先 device.stop()（等音频线程退出）→ 再 _close_decoder()」，
+  从根上杜绝"状态变了但生成器还在跑"的孤儿流。
+- 关闭后再次 `play()` 会重新创建生成器（`_start_stream` 先关旧再开新），可正常重放。
+
+【P1-1 修复 · 错误码日志】
+- 所有 `AudioError` 抛出前统一经 `_fail()` 记录 `code=...`，便于日志检索。
 """
 
 from __future__ import annotations
@@ -20,6 +29,7 @@ import array
 import logging
 import os
 import threading
+from collections.abc import Iterator
 from typing import Callable
 
 import miniaudio
@@ -47,9 +57,16 @@ class AudioError(Exception):
         self.code = code
 
 
+def _fail(code: ErrorCode, message: str) -> AudioError:
+    """【P1-1】统一构造并记录 AudioError：日志里始终带 ErrorCode。"""
+    logger.warning("audio error code=%s detail=%s", code.value, message)
+    return AudioError(message, code)
+
+
 class AudioEngine:
     def __init__(self) -> None:
         self._device: miniaudio.PlaybackDevice | None = None
+        self._stream: Iterator[array.array] | None = None  # 【P1-7】当前 PCM 生成器
         self._path: str | None = None
         self._duration = 0.0
         self._frames_played = 0  # 已播出的 PCM 帧数（含 seek 起点）
@@ -68,23 +85,23 @@ class AudioEngine:
     # ---------- 公开 API ----------
     def load(self, path: str) -> None:
         if not os.path.isfile(path):
-            raise AudioError(f"文件不存在：{path}", ErrorCode.IO_ERROR)
+            raise _fail(ErrorCode.IO_ERROR, f"文件不存在：{path}")
         ext = os.path.splitext(path)[1].lower()
         if ext in PIPE_EXTS:
-            raise AudioError(
-                "该格式走 ffmpeg 管道，Phase 1 接入，Phase 0 暂不支持",
+            raise _fail(
                 ErrorCode.FORMAT_NOT_SUPPORTED,
+                "该格式走 ffmpeg 管道，Phase 1 接入，Phase 0 暂不支持",
             )
         if ext not in NATIVE_EXTS:
-            raise AudioError(
-                f"不支持的格式：{ext or '（无扩展名）'}",
+            raise _fail(
                 ErrorCode.FORMAT_NOT_SUPPORTED,
+                f"不支持的格式：{ext or '（无扩展名）'}",
             )
         try:
             info = miniaudio.get_file_info(path)
         except Exception as exc:  # noqa: BLE001
-            raise AudioError(f"解码器打不开这个文件：{exc}", ErrorCode.FILE_CORRUPT) from exc
-        self.stop()
+            raise _fail(ErrorCode.FILE_CORRUPT, f"解码器打不开这个文件：{exc}") from exc
+        self.stop()  # 【P1-7】stop() 内部会关闭旧解码器
         with self._lock:
             self._path = path
             self._duration = float(info.duration or 0.0)
@@ -115,15 +132,16 @@ class AudioEngine:
             self._pending_error = False
             # 先置位再 start：避免极短文件在 start 返回前就触发 _on_finished 被覆盖
             self._state = State.PLAYING
-        assert self._device is not None
-        self._device.start(self._pcm_stream(start_frame))
+        self._start_stream(start_frame)
 
     def pause(self) -> None:
         with self._lock:
             if self._state is not State.PLAYING or self._device is None:
                 return
             self._state = State.PAUSED
+        # 【P1-7】先停设备（等音频线程退出），再关生成器，杜绝孤儿流
         self._device.stop()
+        self._close_decoder()
 
     def toggle(self) -> None:
         # 【P0-1】走纯只读的 state 属性，不再依赖原始 _state 字段。
@@ -138,6 +156,7 @@ class AudioEngine:
                 self._device.stop()
             except Exception:  # noqa: BLE001 - 关闭时不纠结
                 pass
+        self._close_decoder()  # 【P1-7】与 pause 汇聚到同一处关闭
         with self._lock:
             self._state = State.STOPPED
             self._frames_played = 0
@@ -157,13 +176,16 @@ class AudioEngine:
             self._frames_played = frame
             self._pending_finished = False
         if was_playing and self._device is not None:
+            # 【P1-7】先停 → 关旧生成器 → 再开新流
             self._device.stop()
-            self._device.start(self._pcm_stream(frame))
+            self._close_decoder()
+            self._start_stream(frame)
 
     def poll(self) -> None:
-        """【P0-1/P0-3】主线程调用：消费音频线程的一次性事件并触发回调。
+        """【P0-1/P0-3/P1-7】主线程调用：消费音频线程的一次性事件并触发回调。
 
-        该方法是 UI 与音频线程之间唯一的事件出口，本身不改变播放状态。
+        该方法是 UI 与音频线程之间唯一的事件出口。除资源清理（停设备 + 关生成器）外，
+        **不改变播放状态**——状态由音频线程的显式转移决定。
         """
         with self._lock:
             finished = self._pending_finished
@@ -171,6 +193,14 @@ class AudioEngine:
             errored = self._pending_error
             self._pending_error = False
             code, msg = self._error_code, self._error_msg
+        if finished or errored:
+            # 【P1-7】流已自然结束或出错：停设备并回收生成器引用（不改 _state）
+            if self._device is not None:
+                try:
+                    self._device.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._close_decoder()
         if finished and self.on_finished is not None:
             self.on_finished()
         if errored and self.on_error is not None:
@@ -209,7 +239,7 @@ class AudioEngine:
         return self._path
 
     def shutdown(self) -> None:
-        self.stop()
+        self.stop()  # 【P1-7】内含关闭生成器
         if self._device is not None:
             try:
                 self._device.close()
@@ -227,7 +257,29 @@ class AudioEngine:
                     sample_rate=_SAMPLE_RATE,
                 )
             except Exception as exc:  # noqa: BLE001
-                raise AudioError(f"打不开声卡：{exc}", ErrorCode.DEVICE_NOT_FOUND) from exc
+                raise _fail(ErrorCode.DEVICE_NOT_FOUND, f"打不开声卡：{exc}") from exc
+
+    def _start_stream(self, seek_frame: int) -> None:
+        """【P1-7】创建新 PCM 生成器并交给设备；调用前旧流必须已关闭。"""
+        self._close_decoder()  # 兜底：确保没有旧生成器残留
+        assert self._device is not None
+        gen = self._pcm_stream(seek_frame)
+        self._stream = gen
+        self._device.start(gen)
+
+    def _close_decoder(self) -> None:
+        """【P1-7】关闭当前 PCM 生成器（其 finally 会释放底层解码器）。
+
+        stop / pause / seek / load / 错误清理 / shutdown 六条路径全部汇聚到这里。
+        调用前提：设备已 stop（音频线程已退出），否则生成器可能正在执行。
+        """
+        gen = self._stream
+        self._stream = None
+        if gen is not None:
+            try:
+                gen.close()
+            except Exception as exc:  # noqa: BLE001 - 含 ValueError(generator already executing)
+                logger.debug("decoder close skipped: %s", exc)
 
     def _on_finished(self) -> None:
         """【P0-1】音频线程在生成器正常耗尽时调用：显式转移到 FINISHED。
@@ -280,7 +332,7 @@ class AudioEngine:
             # 循环正常结束 = 自然播完（被 stop/pause/seek 中断时走 GeneratorExit，不会到这里）
             self._on_finished()
         finally:
-            # 【P0-3】无论正常结束、异常还是被提前关闭，都释放底层解码器。
+            # 【P1-7】无论正常结束、异常还是被 close()，都释放底层解码器。
             if raw is not None:
                 try:
                     raw.close()
