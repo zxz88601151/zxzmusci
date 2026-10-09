@@ -44,7 +44,7 @@ class IOError_(Exception):
 # 原稿把 IOError 也列为故障类型；这里保留名字但避免遮蔽内建 IOError
 IOError = IOError_  # noqa: A001
 
-FAULTS = {"DECODE_ERROR", "IO_ERROR", "DEVICE_ERROR"}
+FAULTS = {"DECODE_ERROR", "IO_ERROR", "DEVICE_ERROR", "STOP_ERROR", "CLOSE_ERROR", "READ_ERROR", "INFO_ERROR"}
 
 # 替身"解码器"认得的扩展名。真实 miniaudio 会对不支持的格式报错，
 # 替身也照做——否则 M3「非法路径抛 DecodeError」无从验证。
@@ -57,6 +57,12 @@ DEFAULTS = {
     "amplitude": 10000,       # PCM 幅值（16bit）
     "mode": "ok",             # "ok" | "decode_error" | "io_error"
     "start_fault": None,      # None | "DEVICE_ERROR"
+    # ---- 【D5/D6 新增】异常面注入：默认全 None（行为与旧版完全一致）----
+    "stop_fault": None,       # None | "DEVICE_ERROR"：device.stop() 抛
+    "close_fault": None,      # None | "DEVICE_ERROR"：device.close() 抛
+    # ---- 【D6 新增】解码器异常面：把「真实 miniaudio 才有的失败」搬进替身 ----
+    "raise_on_read": False,   # 读到第 1 段后抛 IOError（模拟流中途断开）
+    "raise_on_info": False,   # get_file_info() 抛 DecodeError（模拟探测文件失败）
 }
 
 BACKEND: dict = dict(DEFAULTS)
@@ -84,6 +90,7 @@ class FakeDevice:
         self.gen = None
         self.started = 0
         self.stopped = 0
+        self.closed = 0          # 【D5】close 调用次数（原先不可观测）
         self.state_at_stop: list[str] = []
         self.engine = None       # 由测试注入，用于快照 state
 
@@ -99,9 +106,19 @@ class FakeDevice:
         self.gen = None
         if self.engine is not None:
             self.state_at_stop.append(self.engine.state)
+        # 【D6】异常面：真实 PlaybackDevice.stop() 在设备已失效时会抛。
+        # 由此才能让引擎里 5 处 `try: device.stop() except Exception: pass` 真正执行到。
+        if BACKEND.get("stop_fault") == "DEVICE_ERROR":
+            raise DeviceError("Simulated device stop failure")
 
     def close(self):
-        pass
+        # 【D5】close 必须可观测：原先 `pass` 导致「shutdown 是否真的关闭了设备」
+        # 在替身里完全无法断言（R10 只记录了 device.stop / raw.close）。
+        self.closed += 1
+        EVENTS.append("device.close")
+        # 【D6】异常面：真实 close() 在重复关闭时会抛。
+        if BACKEND.get("close_fault") == "DEVICE_ERROR":
+            raise DeviceError("Simulated device close failure")
 
     @property
     def is_running(self) -> bool:
@@ -123,12 +140,19 @@ def _stream_file(path, **kw):
     - 扩展名不在 SUPPORTED_EXTS → 立即抛 DecodeError（模拟"打不开"）
     - mode == "decode_error"     → 产出 1 段后抛 DecodeError（模拟中途损坏）
     - mode == "io_error"         → 产出 1 段后抛 IOError（模拟读盘中断）
+    - raise_on_read == True      → 产出 1 段后抛 IOError（【D6】模拟流中途断开）
     """
     try:
         if not str(path).lower().endswith(SUPPORTED_EXTS):
             raise DecodeError(f"Unsupported format: {path}")
         amp = BACKEND["amplitude"]
         mode = BACKEND["mode"]
+        if BACKEND.get("raise_on_read"):
+            # 【D6】真实 miniaudio 的流在文件被拔掉/网络断时会抛 OSError。
+            # 这里让它**在产出第一段之后**抛，才能让 `_pcm_stream` 里那个
+            # `except Exception` 分支真正执行到（并验证「异常不穿出音频回调」）。
+            yield array.array("h", [amp, amp])
+            raise IOError_("Simulated mid-stream IO error")
         if mode in ("decode_error", "io_error", "error"):
             yield array.array("h", [amp, amp])
             if mode == "io_error":
@@ -142,9 +166,21 @@ def _stream_file(path, **kw):
         EVENTS.append("raw.close")
 
 
+def _get_file_info(path):
+    """get_file_info 替身。【D6】raise_on_info 时抛 DecodeError。
+
+    真实 miniaudio 探测一个损坏文件时会抛，引擎在 `load()` 里用
+    `except Exception → _fail(FILE_CORRUPT)` 兜住。原先替身永远返回成功，
+    该 except 分支永远测不到。
+    """
+    if BACKEND.get("raise_on_info"):
+        raise DecodeError(f"cannot probe {path}")
+    return _FileInfo(BACKEND["duration"])
+
+
 _FAKE.SampleFormat = _SampleFormat
 _FAKE.PlaybackDevice = FakeDevice
-_FAKE.get_file_info = lambda p: _FileInfo(BACKEND["duration"])
+_FAKE.get_file_info = _get_file_info
 _FAKE.stream_file = _stream_file
 
 
@@ -173,11 +209,24 @@ def install() -> None:
 
 
 def set_fault(name: str) -> None:
-    """故障注入：DECODE_ERROR / IO_ERROR / DEVICE_ERROR。"""
+    """故障注入：DECODE_ERROR / IO_ERROR / DEVICE_ERROR / STOP_ERROR / CLOSE_ERROR
+    / READ_ERROR / INFO_ERROR。
+
+    【D6】新增的四类（STOP/CLOSE/READ/INFO）专门用于让引擎里那些
+    `except Exception: pass` 与 `except Exception → _fail(...)` 分支**真的被执行到**。
+    """
     if name not in FAULTS:
         raise ValueError(f"unknown fault: {name}")
     if name == "DEVICE_ERROR":
         BACKEND["start_fault"] = "DEVICE_ERROR"
+    elif name == "STOP_ERROR":
+        BACKEND["stop_fault"] = "DEVICE_ERROR"
+    elif name == "CLOSE_ERROR":
+        BACKEND["close_fault"] = "DEVICE_ERROR"
+    elif name == "READ_ERROR":
+        BACKEND["raise_on_read"] = True
+    elif name == "INFO_ERROR":
+        BACKEND["raise_on_info"] = True
     elif name == "IO_ERROR":
         BACKEND["mode"] = "io_error"
     else:
@@ -185,5 +234,8 @@ def set_fault(name: str) -> None:
 
 
 def clear_fault() -> None:
-    BACKEND["start_fault"] = None
-    BACKEND["mode"] = "ok"
+    """清除全部故障注入（DEFAULTS 含所有开关，逐个还原）。"""
+    for key in ("start_fault", "stop_fault", "close_fault", "mode"):
+        BACKEND[key] = DEFAULTS[key]
+    BACKEND["raise_on_read"] = DEFAULTS["raise_on_read"]
+    BACKEND["raise_on_info"] = DEFAULTS["raise_on_info"]

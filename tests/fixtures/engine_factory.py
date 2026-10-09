@@ -21,8 +21,6 @@
 
 from __future__ import annotations
 
-import time
-
 from player.engine.player import (
     FADE_IN_MS,
     FADE_OUT_MS,
@@ -41,11 +39,19 @@ def create_engine(fade_in_ms: float = FADE_IN_MS,
     return engine
 
 
-def settle(engine: AudioEngine, limit: int = 900) -> None:
+def settle(engine: AudioEngine, limit: int = 900) -> bool:
     """推进淡出到底并让 poll() 收尾，直到引擎不再有挂起事件。
 
     【为什么必须】stop()/pause() 已异步化（F7）：终态发生在"淡出走完 + poll() 收尾"
     之后，而不是调用返回时。禁止用裸 time.sleep() 代替本函数。
+
+    【D2 修复 · 结构性假绿堵口】原实现在耗尽 `limit` 后**静默返回** ——
+    调用方无法区分"已收敛"与"超限放弃"，于是"审的是半途状态"却显示为通过。
+    现在改为：耗尽即抛 `AssertionError`，并把当时的 state / fade_pending /
+    _pending_finalize 一并带出，让失败可定位。
+
+    返回 True 仅表示"本轮确实观察到了收敛"；调用方**不应**依赖返回值做判断
+    （未收敛会抛异常）。保留返回值只是为了兼容 `assert settle(...)` 写法。
     """
     for _ in range(limit):
         gen = engine._stream
@@ -56,7 +62,15 @@ def settle(engine: AudioEngine, limit: int = 900) -> None:
                 pass
         engine.poll()
         if not engine.fade_pending and engine._pending_finalize is None:
-            return
+            return True
+    # 耗尽 limit 仍未收敛 —— 这是**真问题**，不是 flaky：要么被测代码没收尾，
+    # 要么本用例给的状态机前提不成立。必须显式暴露，绝不静默放过。
+    raise AssertionError(
+        f"settle() 未在 {limit} 步内收敛（疑似假绿窗口）："
+        f"state={engine.state!r} fade_pending={engine.fade_pending} "
+        f"_pending_finalize={engine._pending_finalize!r} "
+        f"_stream={'None' if engine._stream is None else 'alive'}"
+    )
 
 
 def is_exhausted(gen) -> bool:
@@ -68,12 +82,6 @@ def is_exhausted(gen) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return False
-
-
-def measure_burst_ms(engine_factory, loads: int = 5, poll_interval: float = 0.0) -> float:
-    """测量 N 次 load() 的控制路径总耗时（F7 用）。"""
-    engine = engine_factory()
-    return 0.0  # 占位：实际测量在测试内联完成
 
 
 __all__ = [

@@ -160,11 +160,20 @@ def miniaudio_stub():
 
 @pytest.fixture(scope="session")
 def qt_app():
-    """会话级 QApplication（真实 PySide6 + offscreen）。未装 PySide6 时跳过。"""
+    """会话级 QApplication（真实 PySide6 + offscreen）。未装 PySide6 时跳过。
+
+    【D3 修复】平台初始化失败（Linux headless 缺 libEGL/libxkbcommon 等）
+    一律降级为 **skip**，绝不抛给收集期 —— 否则 `pytest -m qt` 整步会以
+    "收集错误"失败，而不是优雅跳过。Qt 用例的降级路径必须比硬错误更常见。
+    """
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
 
-    return QApplication.instance() or QApplication([])
+    try:
+        app = QApplication.instance() or QApplication([])
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"无法初始化 QApplication（Qt 平台插件不可用）：{exc}")
+    return app
 
 
 # ============ 纯辅助（供原生用例 import）============
@@ -186,7 +195,8 @@ def rms(chunk) -> float:
     return math.sqrt(sum(s * s for s in chunk) / len(chunk))
 
 
-def settle(engine, limit: int = 900) -> None:
+def settle(engine, limit: int = 900) -> bool:
+    """严格 settle：耗尽 limit 仍未收敛则抛 AssertionError（D2 修复）。"""
     from fixtures.engine_factory import settle as _s
 
     return _s(engine, limit=limit)

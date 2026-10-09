@@ -19,10 +19,13 @@ import types
 _SR = 44100
 import _audio_stub  # noqa: E402
 
-# 共享替身后端：sys.modules["miniaudio"] 只在**首次 import 引擎**时生效，
-# 因此所有套件必须用同一个替身（差异只体现在 configure() 的参数上），
-# 否则后加载的套件会拿到先加载套件的后端。
-_audio_stub.install()
+# 【D1 修复】替身由 conftest.py 顶层**唯一入口** install()。
+# 原先此处也调一次 install()，形成"双入口"：靠 install() 幂等才侥幸正确。
+# 现在改为**显式断言**替身已在位 —— 把隐式 import 顺序依赖变成显式契约，
+# 一旦 conftest 的注入失效，这里立刻报错而不是静默退回真 miniaudio。
+assert sys.modules.get("miniaudio") is not None, (
+    "替身未注入：conftest.py 顶层 install() 应已执行（收集期早于本模块 import）"
+)
 
 pytestmark = pytest.mark.engine
 BACKEND = _audio_stub.BACKEND
@@ -201,6 +204,71 @@ def test_f7_interrupt():
     check("F7-5 新流首帧增益 ≈ 接管点（无跳变）", abs(g0[0] - handoff) < 0.02,
           f"first={g0[0]:.6f} handoff={handoff:.6f}")
     check("F7-5 增益曲线连续（首帧 > 0，非从静音起跳）", g0[0] > 0.0, f"{g0[0]:.6f}")
+
+    # ═══════════ G1【弱断言·量化】cancel 瞬间旧流末帧 gain 的衰减台阶 ═══════════
+    # 缺口：F7-5 只验证"新流从接管点起跳"，却从没验证**被丢弃的旧流**在
+    # cancel 那一刻是怎么收尾的。旧流走 `_ramp_out_chunk`：从"当前有效增益"
+    # 线性降到 0（一整段 chunk 内）。若这段 ramp 存在跳变，就是爆音源 ——
+    # 此前无任何断言覆盖。
+    #
+    # 【为何分两步】集成路径（load 触发 cancel）里 envelope 已被 cancel，
+    # 有效增益归零 → ramp 是平凡的 0→0，证明力弱。故：
+    #   G1-a 集成路径：确认旧流确实产出 ramp-out 段且不再计数（真实性）
+    #   G1-b 单元路径：直接给 `_ramp_out_chunk` 一个非零起始增益，量化其数学形状
+    print("── G1 ──")
+    # G1-a 集成路径
+    e2 = new_engine()
+    e2.load(A)
+    e2.play()
+    pump(e2, 2)
+    e2.pause()
+    pump(e2, 1)
+    e2.load(B)                      # 中断接管 → 旧代次失效
+    stale_stream = e2._pcm_stream(0, e2.generation - 1)
+    try:
+        out = next(stale_stream)
+    except StopIteration:
+        out = None
+    check("G1-a 代次失效后旧流仍产出 ramp-out 段（不空手而退）",
+          out is not None and len(out) > 0)
+    if out is not None and len(out) > 0:
+        frames_a = len(out) // 2
+        last_a = max(0.0, out[(frames_a - 1) * 2] / 10000.0)
+        # 阈值收紧到 2 LSB：真实实现末帧精确为 0；若 ramp 不降到底（残留 start），
+        # 0.02 的老阈值会漏掉 1.5% 量级的残留 —— 那是弱断言的典型病（容差 > 待测量）
+        check("G1-a 集成路径末帧增益 ≈ 0（旧流消失前收到静音）", last_a <= 2 / 10000.0,
+              f"last={last_a:.6f}")
+
+    # G1-b 单元路径：非零起始增益下的 ramp 形状量化
+    # 给引擎一个可控的非零 smooth_gain，并推进 fade 让 current_gain 落到非零值，
+    # 直接调 _ramp_out_chunk，量化"从非零增益线性降到 0"的台阶形状。
+    e3 = new_engine()
+    e3._smooth_gain = 0.5
+    e3._fade.reset(1.0, FADE_IN_MS)      # 淡入从 0 走向 1.0
+    e3._fade.block(256)                  # 推进淡入 → current_gain 非零
+    start_b = e3._smooth_gain * e3._fade.current_gain
+    check("G1-b 前置：起始增益确为非零（否则本断言平凡无意义）", start_b > 0.01,
+          f"start={start_b:.6f}")
+    chunk_frames = 512
+    raw = array.array("h", [10000] * (chunk_frames * 2))
+    ramp = e3._ramp_out_chunk(raw)
+    rf = len(ramp) // 2
+    first_b = ramp[0] / 10000.0
+    last_b = ramp[(rf - 1) * 2] / 10000.0
+    check("G1-b ramp-out 长度与原段一致（不丢帧）", rf == chunk_frames, f"{rf} vs {chunk_frames}")
+    check("G1-b ramp-out 首帧 ≈ 起始有效增益", abs(first_b - start_b) <= 2 / 10000.0,
+          f"first={first_b:.6f} start={start_b:.6f}")
+    check("G1-b ramp-out 末帧 ≈ 0", last_b <= 2 / 10000.0, f"last={last_b:.6f}")
+    check("G1-b ramp-out 单调不增", last_b <= first_b + 1e-9,
+          f"first={first_b:.6f} last={last_b:.6f}")
+    # 相邻帧台阶上界：线性 ramp 的步长 = |start|/(frames-1)，允许 2 LSB 量化误差
+    step_ub = abs(first_b) / max(1, rf - 1) + 2 / 10000.0
+    max_step = max(
+        abs(ramp[(i + 1) * 2] - ramp[i * 2]) / 10000.0 for i in range(rf - 1)
+    )
+    check("G1-b ramp-out 无爆音台阶（逐帧差 ≤ 线性步长上界）", max_step <= step_ub + 1e-9,
+          f"max_step={max_step:.6f} ub={step_ub:.6f}")
+    e3.shutdown()
 
     # ═══════════ F7-6 / F7-7 / F7-8 / F7-9 5 连点终态 ═══════════
     print("── F7-6 ~ F7-9 ──")

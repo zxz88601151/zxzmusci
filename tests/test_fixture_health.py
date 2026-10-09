@@ -61,6 +61,25 @@ def test_f2_settle_after_stop_reaches_stopped(tmp_path):
         engine.shutdown()
 
 
+def test_f2b_settle_raises_when_limit_exhausted(tmp_path):
+    """F2b【D2 修复证据】：settle 在 limit 耗尽时**必须抛异常**，不许静默返回。
+
+    F2 证明"limit 充足时能收敛"；F2b 证明"limit 不足时不会假装成功"。
+    二者合起来才说明 settle 有裁决权。详见 test_settle_contract.py。
+    """
+    p = tmp_path / "a.mp3"
+    p.write_bytes(b"")
+    engine = create_engine()
+    try:
+        engine.load(str(p))
+        engine.play()
+        engine.stop()
+        with pytest.raises(AssertionError, match="未在 1 步内收敛"):
+            settle(engine, limit=1)
+    finally:
+        engine.shutdown()
+
+
 # ═══════════════ F3 零淡出边界不阻塞 ═══════════════
 def test_f3_settle_returns_immediately_when_fade_out_zero(tmp_path):
     """F3：fade_out_ms=0 时 settle() 立即返回（不 sleep）。"""
@@ -155,6 +174,31 @@ def test_f6b_backend_reset_between_tests():
     """
     assert BACKEND["duration"] == DEFAULTS["duration"], BACKEND["duration"]
     assert BACKEND["chunks"] == DEFAULTS["chunks"], BACKEND["chunks"]
+
+
+def test_f6d_install_has_single_entry_point():
+    """F6（D）【D1 修复证据】：替身 install() 必须只有**一个**调用点。
+
+    修复前 conftest 顶层装一次、6 个业务套件各自又装一次 —— 靠 install()
+    幂等才侥幸正确（"双入口"，认知债）。D1 修复后业务套件改成**断言替身已在位**，
+    全仓只剩 conftest 顶层一处 install()。本条扫描 tests/ 源码来守住这一点。
+    """
+    import pathlib
+
+    here = pathlib.Path(__file__).parent
+    callers = []
+    for py in here.rglob("*.py"):
+        if py.name == "mock_miniaudio.py":      # 定义处不算调用点
+            continue
+        text = py.read_text(encoding="utf-8")
+        for i, line in enumerate(text.splitlines(), 1):
+            s = line.strip()
+            if s in ("install()", "_audio_stub.install()", "_audio_stub.install()  # noqa"):
+                callers.append(f"{py.name}:{i}")
+
+    assert callers == ["conftest.py:45"], (
+        f"install() 调用点不唯一：{callers}（期望仅 conftest.py:45）"
+    )
 
 
 def test_f6c_engine_instances_do_not_share_state(tmp_path):

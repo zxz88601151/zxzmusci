@@ -27,14 +27,70 @@ jobs:
           # PySide6-Essentials：只需 QtCore/QtWidgets，避免拉入数百 MB 的 Addons
           pip install PySide6-Essentials pytest pytest-cov
 
+      # 【D3 修复】Ubuntu headless 下 QtGui/QtWidgets 需要这些系统库；
+      # 缺了会让 QApplication() 在**收集期**抛错，整步以"收集错误"失败（而非 skip）。
+      - name: 安装 Qt 运行时系统库
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-cursor0
+
       - name: 引擎测试（无需 Qt，也不需要显示器）
         run: pytest -m engine -v --tb=short
 
+      # Qt 测试（offscreen 无头）。conftest 的 qt_app fixture 已做降级：
+      # 平台初始化失败 → skip（不是收集错误）。此处系统库齐全则应真跑。
       - name: Qt 测试（offscreen 无头）
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -m qt -v --tb=short
 
+      # 【D3 守卫】Qt 用例**全部 skip** 说明 offscreen/系统库没生效 ——
+      # 那是"假绿"：步骤虽然 SUCCESS，实际一条 Qt 断言都没跑。
+      # 上面的降级机制（skip 而非硬错误）是必要的，但必须配这条守卫，
+      # 否则降级会静默吞掉整个 Qt 覆盖率。
+      #
+      # ⚠️ 为什么不能只靠 "skipped == collected"：
+      # 在 headless runner 上如果 Qt 平台初始化失败，`--collect-only` 会以
+      # **INTERNALERROR** 结束，**不打印任何 `tests/...::test_` 行** → TOTAL=0 →
+      # "TOTAL>0 才判定"的条件永远不会成立，守卫沦为摆设。
+      # 因此判据必须同时覆盖「收集数 == 0」这一情形。
+      - name: Guard: Qt 用例不得全部被跳过
+        if: always()
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -uo pipefail
+          COLLECT=$(pytest tests/test_ui_error.py -m qt --collect-only -q 2>&1 || true)
+          echo "--- collect-only ---"; echo "$COLLECT"
+          # 注意：`-q --collect-only` 只打印 "tests/test_ui_error.py: 1"（不含 ::test_），
+          # 用 '^tests' 计数才不会把"确实收集到"误判为 0。
+          TOTAL=$(printf '%s\n' "$COLLECT" | grep -cE '^tests' | head -1)
+          TOTAL=${TOTAL:-0}
+
+          OUT=$(pytest tests/test_ui_error.py -m qt -q --tb=no 2>&1 || true)
+          echo "--- run ---"; echo "$OUT"
+          SKIPPED=$(printf '%s\n' "$OUT" | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' | head -1)
+          SKIPPED=${SKIPPED:-0}
+          PASSED=$(printf '%s\n' "$OUT" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+          PASSED=${PASSED:-0}
+
+          echo "Qt tests: passed=$PASSED skipped=$SKIPPED collected=$TOTAL"
+
+          if [ "$TOTAL" -le 0 ]; then
+            echo "::error::Qt 用例收集数=0（平台初始化失败或 INTERNALERROR）—— 假绿"
+            exit 1
+          fi
+          if [ "$PASSED" -le 0 ]; then
+            echo "::error::Qt 用例 0 passed（$SKIPPED skipped / $TOTAL collected）—— QT_QPA_PLATFORM 或系统库未生效"
+            exit 1
+          fi
+          echo "GUARD PASS: Qt 用例确实执行了 $PASSED 条"
+
+      # 【D4 修复】regression 已拆成 21 个可定位用例（原先仅 1 个）。
+      # 失败时可直接从测试名（test_r09_...）定位，无需翻日志。
       - name: 回归套件（每轮必须绿）
         run: pytest -m regression -v --tb=short
 
