@@ -58,6 +58,24 @@ class _FadeEnvelope:
             self._current = self._target  # 端点精确命中
         return start
 
+    def block(self, n_frames: int) -> tuple[float, float, int]:
+        """推进 n_frames，返回 `(段首增益, 段尾增益, 段内有效帧数)`。
+
+        与 `step()` 的区别：额外告知"本段中有多少帧处于过渡区间"。
+        若本段长于剩余过渡帧数，超出部分应保持段尾增益不变——
+        这样调用方按 `move` 帧做线性插值时，端点仍然精确命中，
+        不会因为 chunk 粒度把包络"拉长"。
+        """
+        if self._frozen or n_frames <= 0 or self._frames_left <= 0:
+            return (self._current, self._current, 0)
+        start = self._current
+        move = min(n_frames, self._frames_left)
+        self._current += self._step * move
+        self._frames_left -= move
+        if self._frames_left <= 0:
+            self._current = self._target
+        return (start, self._current, move)
+
     def freeze(self) -> None:
         """冻结在当前增益（淡出中途 pause）。"""
         self._frozen = True

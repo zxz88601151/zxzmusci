@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from player.engine.player import AudioEngine, AudioError
 from player.engine.states import ErrorCode
 from player.engine.volume_curve import slider_db
+from player.settings import Settings
 from player.ui.error_text import describe
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,8 @@ class MainWindow(QMainWindow):
         self.resize(520, 220)
 
         self.engine = AudioEngine()
+        # 【C3】音量记忆：持久化的是 linear 0~1 滑块值，恢复后经同一条 dB 曲线 ⇒ 听感一致
+        self.settings = Settings()
         self._seeking = False  # 用户正在拖进度条时，不让 timer 回写
         self._error_dialog_open = False  # 【P1-1】防止同一失败重复弹窗
         self._ui_generation = -1  # 【P1-2】UI 当前展示的流代次
@@ -93,9 +96,10 @@ class MainWindow(QMainWindow):
 
         self.vol = QSlider(Qt.Horizontal)
         self.vol.setRange(0, 100)
-        self.vol.setValue(80)
+        self.vol.setValue(int(round(self.settings.volume * 100)))  # 【C3】恢复上次音量
         self.vol.setMaximumWidth(120)
         self.vol.valueChanged.connect(self._on_volume_changed)
+        self.vol.sliderReleased.connect(self._persist_volume)
 
         # 【V6】音量 dB 读数：0.0 → -60.0 dB，1.0 → 0.0 dB，单调递增
         self.vol_db = QLabel()
@@ -162,6 +166,11 @@ class MainWindow(QMainWindow):
         """【V6】滑块 → 引擎音量 + dB 读数（同一套 dB 曲线，保证显示与听感一致）。"""
         self.engine.set_volume(value / 100.0)
         self.vol_db.setText(f"{slider_db(value / 100.0):.1f} dB")
+
+    def _persist_volume(self) -> None:
+        """【C3】落盘 linear 0~1 音量（拖动结束时写一次，避免每 tick 都落盘）。"""
+        self.settings.volume = self.vol.value() / 100.0
+        self.settings.save()
 
     @guard_audio
     def _on_seek_released(self) -> None:
@@ -254,5 +263,6 @@ class MainWindow(QMainWindow):
             self.btn_play.setText(text)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._persist_volume()  # 【C3】退出前再存一次，保证不丢
         self.engine.shutdown()
         super().closeEvent(event)

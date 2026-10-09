@@ -86,7 +86,17 @@ def _fail(code: ErrorCode, message: str) -> AudioError:
 
 
 class AudioEngine:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fade_in_ms: float = FADE_IN_MS,
+        fade_out_ms: float = FADE_OUT_MS,
+        smooth_ms: float = VOLUME_SMOOTH_MS,
+    ) -> None:
+        # 【C2】三个时长抽成构造参数：改任一个都不影响另外两个。
+        self._fade_in_ms = float(fade_in_ms)
+        self._fade_out_ms = float(fade_out_ms)
+        self._smooth_ms = float(smooth_ms)
         self._device: miniaudio.PlaybackDevice | None = None
         self._stream: Iterator[array.array] | None = None
         self._path: str | None = None
@@ -98,12 +108,11 @@ class AudioEngine:
         self._volume = _DEFAULT_VOLUME                    # 原始滑块值 [0,1]
         self._target_gain = linear_to_db_gain(_DEFAULT_VOLUME)
         self._smooth_gain = self._target_gain             # 实际平滑增益
-        self._smooth_frames = max(1.0, _SAMPLE_RATE * VOLUME_SMOOTH_MS / 1000.0)
+        self._smooth_frames = max(1.0, _SAMPLE_RATE * self._smooth_ms / 1000.0)
         self._smooth_alpha = 1.0 - math.exp(-1.0 / self._smooth_frames)
-        self._fade = _FadeEnvelope(1.0, FADE_IN_MS, _SAMPLE_RATE, start_gain=0.0)
+        self._fade = _FadeEnvelope(1.0, self._fade_in_ms, _SAMPLE_RATE, start_gain=0.0)
         self._resume_gain = 0.0
         self._muted = False
-        self._volume_before_mute = _DEFAULT_VOLUME
         self._gain_changed_at = 0.0                       # 目标变更时间戳
         self._fading_out = False                          # 淡出期间抑制 finished
 
@@ -179,7 +188,7 @@ class AudioEngine:
                 return
             self._resume_gain = 0.0 if self._fade.is_done else self._fade.current_gain
             self._fading_out = True
-            self._fade.reset(0.0, FADE_OUT_MS)
+            self._fade.reset(0.0, self._fade_out_ms)
         self._wait_fade_out()
         self._device.stop()
         self._close_decoder()
@@ -199,7 +208,7 @@ class AudioEngine:
             was_active = self._state is State.PLAYING and self._stream is not None
             if was_active:
                 self._fading_out = True
-                self._fade.reset(0.0, FADE_OUT_MS)
+                self._fade.reset(0.0, self._fade_out_ms)
         if was_active:
             self._wait_fade_out()
         with self._lock:
@@ -235,7 +244,7 @@ class AudioEngine:
             self._generation += 1          # 立即失效：旧代次进度/EOF/错误全部丢弃
             self._frames_played = frame
             self._pending_finished = False
-            self._fade.reset(1.0, FADE_IN_MS)  # 取消任何进行中的淡出，改为新位置淡入
+            self._fade.reset(1.0, self._fade_in_ms)  # 取消任何进行中的淡出，改为新位置淡入
         if was_playing and self._device is not None:
             time.sleep(_FADE_MARGIN + 0.015)   # 等一个 chunk 的 ramp-out 尾巴
             self._device.stop()
@@ -272,9 +281,9 @@ class AudioEngine:
     # ---- 音量 / 静音 ----
     def set_volume(self, v: float) -> None:
         """只写目标增益（锁内）+ 记录变更时间戳；实际增益由 _pcm_stream 逐帧插值。"""
-        from player.engine.volume_curve import _clamp01
+        from player.engine.volume_curve import clamp01
 
-        v = _clamp01(v)
+        v = clamp01(v)
         with self._lock:
             self._volume = v
             if not self._muted:
@@ -282,16 +291,19 @@ class AudioEngine:
                 self._gain_changed_at = time.monotonic()
 
     def set_muted(self, flag: bool) -> None:
-        """mute 复用同一套平滑逻辑：目标置 0；unmute 恢复 mute 前的音量。"""
+        """mute 复用同一套平滑逻辑：目标置 0；unmute 恢复音量。
+
+        注：unmute 用**当前** `_volume`（滑块值）而非"mute 前的快照"——若用户在静音
+        期间拖动过滑块，UI 与引擎才不会各说各话；未拖动时二者等价（V7 往返仍成立）。
+        """
         with self._lock:
             if flag and not self._muted:
-                self._volume_before_mute = self._volume
                 self._muted = True
                 self._target_gain = 0.0
                 self._gain_changed_at = time.monotonic()
             elif not flag and self._muted:
                 self._muted = False
-                self._target_gain = linear_to_db_gain(self._volume_before_mute)
+                self._target_gain = linear_to_db_gain(self._volume)
                 self._gain_changed_at = time.monotonic()
 
     def shutdown(self) -> None:
@@ -322,6 +334,19 @@ class AudioEngine:
     @property
     def muted(self) -> bool:
         return self._muted
+
+    # 【C2】三个时长只读回显（便于测试与 UI 展示）
+    @property
+    def fade_in_ms(self) -> float:
+        return self._fade_in_ms
+
+    @property
+    def fade_out_ms(self) -> float:
+        return self._fade_out_ms
+
+    @property
+    def smooth_ms(self) -> float:
+        return self._smooth_ms
 
     @property
     def target_gain(self) -> float:
@@ -376,7 +401,7 @@ class AudioEngine:
 
     # ══════════ 内部 ══════════
     def _wait_fade_out(self) -> None:
-        time.sleep(FADE_OUT_MS / 1000.0 + _FADE_MARGIN)
+        time.sleep(self._fade_out_ms / 1000.0 + _FADE_MARGIN)
 
     def _ensure_device(self) -> None:
         if self._device is None:
@@ -396,7 +421,7 @@ class AudioEngine:
         with self._lock:
             generation = self._generation
             self._smooth_gain = self._target_gain
-            self._fade = _FadeEnvelope(1.0, FADE_IN_MS, _SAMPLE_RATE, start_gain=start_gain)
+            self._fade = _FadeEnvelope(1.0, self._fade_in_ms, _SAMPLE_RATE, start_gain=start_gain)
         stream = self._pcm_stream(seek_frame, generation)
         self._stream = stream
         self._device.start(stream)
@@ -458,17 +483,23 @@ class AudioEngine:
         with self._lock:
             smooth = self._smooth_gain
             target = self._target_gain
-            fade0 = self._fade.step(frames)
-            fade1 = self._fade.current_gain
+            # block() 告知"本段内真正处于过渡的帧数 move"：
+            # 超出 move 的帧保持段尾增益，避免 chunk 粒度把包络拉长（端点仍精确命中）。
+            fade0, fade1, move = self._fade.block(frames)
         alpha = self._smooth_alpha
-        inv = 1.0 / (frames - 1) if frames > 1 else 0.0
+        inv = 1.0 / (move - 1) if move > 1 else 0.0
         apply = self._apply_gain
         out = array.array("h")
         append = out.append
         s = smooth
         for i in range(frames):
             s += (target - s) * alpha
-            f = fade0 + (fade1 - fade0) * (i * inv) if frames > 1 else fade1
+            if move <= 0:
+                f = fade1
+            elif i >= move:
+                f = fade1
+            else:
+                f = fade0 + (fade1 - fade0) * (i * inv)
             g = s * f
             base = i * n
             for c in range(n):
@@ -506,7 +537,7 @@ class AudioEngine:
                 seek_frame=seek_frame,
             )
             total_frames = int(self._duration * _SAMPLE_RATE) if self._duration > 0 else 0
-            fade_out_frames = int(_SAMPLE_RATE * FADE_OUT_MS / 1000.0)
+            fade_out_frames = int(_SAMPLE_RATE * self._fade_out_ms / 1000.0)
             eof_fade_at = total_frames - fade_out_frames
             eof_fade_started = False
             abs_pos = seek_frame

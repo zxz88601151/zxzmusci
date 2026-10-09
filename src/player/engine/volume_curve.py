@@ -21,7 +21,7 @@ from __future__ import annotations
 MIN_DB = 60.0
 
 
-def _clamp01(v: float) -> float:
+def clamp01(v: float) -> float:
     """非法输入一律夹到 [0,1] 边界，不抛异常（UI 抖动不应炸引擎）。"""
     try:
         x = float(v)
@@ -38,7 +38,7 @@ def _clamp01(v: float) -> float:
 
 def linear_to_db_gain(v: float) -> float:
     """滑块值 → 线性增益（等响近似）。v<=0 返回 0.0（真静音）。"""
-    v = _clamp01(v)
+    v = clamp01(v)
     if v <= 0.0:
         return 0.0
     return 10.0 ** ((v - 1.0) * MIN_DB / 20.0)

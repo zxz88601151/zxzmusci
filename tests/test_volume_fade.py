@@ -15,6 +15,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 import threading
 import types
 
@@ -60,7 +61,7 @@ def _stream_file(path, **kw):
         raise RuntimeError("boom: 文件损坏")
     n = BACKEND["frames_per_chunk"]
     for _ in range(BACKEND["chunks"]):
-        yield array.array("h", [8000, -8000] * n)
+        yield array.array("h", [10000, 10000] * n)
 
 
 _FAKE.SampleFormat = _SampleFormat
@@ -448,6 +449,109 @@ for _act in (True, False, True, False):
         _g7.extend(max(0.0, _out[i * 2] / 10000.0) for i in range(1024))
 _viol7 = [(a, b) for a, b in zip(_g7, _g7[1:]) if a > 1e-6 and not (0.5 <= b / a <= 2.0)]
 check("V7 mute/unmute 往返曲线连续无跳变", not _viol7, f"违规={len(_viol7)}")
+
+# ═══════════════ H. C1~C4 断言清单 ═══════════════
+print("── H. C1~C4 ──")
+import json  # noqa: E402
+
+from player.settings import Settings  # noqa: E402
+
+# C1 播放中拖动音量滑块 → 过渡平滑、RMS 曲线无台阶跳变
+_e = AudioEngine()
+with _e._lock:
+    _e._smooth_gain = _e._target_gain
+    _e._fade = _FadeEnvelope(1.0, 1.0, _SR, start_gain=1.0)
+_c1_gains: list[float] = []
+for _v in [0.05 + 0.95 * _i / 19 for _i in range(20)]:   # 模拟人手拖动：20 个小步
+    _e.set_volume(_v)                     # 模拟拖动过程中的连续 set_volume
+    for _ in range(3):
+        _out = _e._apply_gain_envelope(const(512), 512)
+        _c1_gains.extend(max(0.0, _out[i * 2] / 10000.0) for i in range(512))
+_c1_d = [abs(b - a) for a, b in zip(_c1_gains, _c1_gains[1:])]
+check("C1 拖动音量：逐帧无台阶跳变", max(_c1_d) < 0.002, f"max={max(_c1_d):.6f}")
+_w = 441
+_c1_win = [
+    sum(_c1_gains[i : i + _w]) / _w
+    for i in range(0, len(_c1_gains) - _w, _w)
+]
+_c1_db = [20 * math.log10(max(v, 1e-4)) for v in _c1_win]
+_c1_ddb = [abs(b - a) for a, b in zip(_c1_db, _c1_db[1:])]
+check("C1 窗口化曲线无台阶（相邻 10ms 增益变化 < 2dB）", max(_c1_ddb) < 2.0,
+      f"max={max(_c1_ddb):.3f}dB")
+
+# C2 FADE_IN_MS / FADE_OUT_MS / SMOOTH_MS 改为 50/600/200 后生效且互不干扰
+_e = AudioEngine(fade_in_ms=50, fade_out_ms=600, smooth_ms=200)
+check("C2 fade_in_ms=50 生效", _e.fade_in_ms == 50.0, str(_e.fade_in_ms))
+check("C2 fade_out_ms=600 生效", _e.fade_out_ms == 600.0, str(_e.fade_out_ms))
+check("C2 smooth_ms=200 生效", _e.smooth_ms == 200.0, str(_e.smooth_ms))
+
+BACKEND.update(duration=5.0, chunks=50, frames_per_chunk=2000, mode="ok")
+_e.set_volume(1.0)
+_e.load(A)
+_e.play()
+_c2 = []
+for _ in range(3):
+    _out = next(_e._stream)
+    _c2.extend(max(0.0, _out[i * 2] / 10000.0) for i in range(2000))
+check("C2 淡入在 50ms 内到位（不受 smooth=200 干扰）",
+      _c2[min(int(50 / 1000 * _SR), len(_c2) - 1)] >= 0.95,
+      f"g[2205]={_c2[min(2205, len(_c2) - 1)]:.4f}")
+
+_e2 = AudioEngine(smooth_ms=200)
+with _e2._lock:
+    _e2._smooth_gain = 1.0
+    _e2._target_gain = 0.0
+    _e2._fade = _FadeEnvelope(1.0, 1.0, _SR, start_gain=1.0)
+_out = _e2._apply_gain_envelope(const(8820), 8820)
+_g_at_tau = _out[8818 * 2] / 10000.0
+check("C2 平滑时间常数 200ms 生效（τ 处 ≈0.368）", close(_g_at_tau, math.exp(-1), 0.02),
+      f"{_g_at_tau:.4f}")
+
+_e3 = AudioEngine(fade_out_ms=600)
+_e3.set_volume(1.0)
+_e3.load(A)
+_e3.play()
+_t0 = time.perf_counter()
+_e3.stop()
+_el = (time.perf_counter() - _t0) * 1000
+check("C2 淡出 600ms 生效（stop 阻塞 ≥600ms）", _el >= 600 * 0.95, f"{_el:.0f}ms")
+
+# C3 音量记忆：存 linear 0~1，恢复后听感一致
+_p = os.path.join(tempfile.mkdtemp(), "settings.json")
+_s = Settings(_p)
+_s.volume = 0.37
+_s.save()
+_s2 = Settings(_p)
+check("C3 恢复音量（linear 0~1）", close(_s2.volume, 0.37, 1e-9), f"{_s2.volume}")
+with open(_p, encoding="utf-8") as _f:
+    _raw = json.load(_f)
+check("C3 落盘的是 linear 值而非 dB/gain", close(_raw["volume"], 0.37, 1e-9), str(_raw))
+check("C3 恢复后听感一致（同一条 dB 曲线）",
+      linear_to_db_gain(_s2.volume) == linear_to_db_gain(0.37))
+_s.volume = 5.0
+check("C3 越界值被 clamp 到 1.0", _s.volume == 1.0, str(_s.volume))
+with open(_p, "w", encoding="utf-8") as _f:
+    _f.write("{ 这不是合法 JSON")
+check("C3 设置文件损坏不炸启动（回退默认 0.8）", close(Settings(_p).volume, 0.8, 1e-9),
+      str(Settings(_p).volume))
+
+# C4 静音状态下切歌 → 新歌仍静音
+_e = AudioEngine()
+_e.set_volume(1.0)
+_e.set_muted(True)
+_e.load(A)
+_e.play()
+_out = next(_e._stream)
+check("C4 静音下切歌 → 新歌仍静音（全 0）", all(s == 0 for s in _out),
+      f"max|s|={max(abs(s) for s in _out)}")
+check("C4 静音期间目标增益仍为 0", _e.target_gain == 0.0, str(_e.target_gain))
+_e.set_volume(0.9)  # 静音期间调音量
+_out2 = next(_e._stream)
+check("C4 静音期间调音量仍不出声", all(s == 0 for s in _out2),
+      f"max|s|={max(abs(s) for s in _out2)}")
+_e.set_muted(False)
+check("C4 解除静音后恢复音量", close(_e.target_gain, linear_to_db_gain(0.9), 1e-12),
+      f"{_e.target_gain:.5f}")
 
 print()
 print("RESULT:", "ALL PASS" if not _FAILS else f"{len(_FAILS)} FAILED -> {_FAILS}")
