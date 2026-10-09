@@ -79,7 +79,12 @@ from player.engine.player import (  # noqa: E402
     AudioEngine,
 )
 from player.engine.states import ErrorCode  # noqa: E402
-from player.engine.volume_curve import db_to_linear, gain_to_db, linear_to_db_gain  # noqa: E402
+from player.engine.volume_curve import (  # noqa: E402
+    db_to_linear,
+    gain_to_db,
+    linear_to_db_gain,
+    slider_db,
+)
 
 # ─────────── 迷你断言框架 ───────────
 _FAILS: list[str] = []
@@ -365,6 +370,84 @@ for i in range(5):
     e.play()
 check("F7 连点切歌 5 次无异常且最终路径正确", os.path.basename(e.current_path) == "a.mp3", str(e.current_path))
 check("F8 连点后仍处于 PLAYING", e.state == "playing", e.state)
+
+# ═══════════════ G. V1~V7 断言清单 ═══════════════
+print("── G. V1~V7 ──")
+_v_sig = sine(4096)
+_v_in = rms(_v_sig)
+
+# V1
+_e = steady_engine(1.0)
+_v_r = rms(_e._apply_gain_envelope(_v_sig, 4096)) / _v_in
+check("V1 set_volume(1.0) → 输出/输入 RMS ∈ [0.95,1.05]", 0.95 <= _v_r <= 1.05, f"{_v_r:.4f}")
+
+# V2
+_e = steady_engine(0.0)
+_v_o = rms(_e._apply_gain_envelope(_v_sig, 4096))
+check("V2 set_volume(0.0) → 输出 RMS < 1e-4", _v_o < 1e-4, f"{_v_o:.2e}")
+
+# V3
+_e = steady_engine(0.5)
+_v_r = rms(_e._apply_gain_envelope(_v_sig, 4096)) / _v_in
+check("V3 set_volume(0.5) → 增益 ≈0.0316（±10%）", close(_v_r, 0.0316, 0.00316), f"{_v_r:.5f}")
+
+# V4 连续变速 0.0→1.0→0.3→1.0，逐帧增益比
+_e = AudioEngine()
+with _e._lock:
+    _e._smooth_gain = _e._target_gain
+    _e._fade = _FadeEnvelope(1.0, 1.0, _SR, start_gain=1.0)
+_gains: list[float] = []
+for _v in (0.0, 1.0, 0.3, 1.0):
+    _e.set_volume(_v)
+    for _ in range(6):
+        _out = _e._apply_gain_envelope(const(1024), 1024)
+        _gains.extend(max(0.0, _out[i * 2] / 10000.0) for i in range(1024))
+_viol = [(a, b) for a, b in zip(_gains, _gains[1:]) if a > 1e-6 and not (0.5 <= b / a <= 2.0)]
+_max_delta = max(abs(b - a) for a, b in zip(_gains, _gains[1:]))
+check("V4 连续变速 → 每帧增益比 ∈ [0.5,2.0]", not _viol, f"违规={len(_viol)}")
+check("V4 无爆音尖刺（单帧增益变化 ≤0.01）", _max_delta <= 0.01, f"max_delta={_max_delta:.6f}")
+
+# V5 越界 / 非法输入
+_e = AudioEngine()
+_v5_ok = True
+for _bad in (-0.1, 1.5, float("nan"), None, "x", float("inf")):
+    try:
+        _e.set_volume(_bad)
+        if not (0.0 <= _e.volume <= 1.0):
+            _v5_ok = False
+    except Exception:
+        _v5_ok = False
+check("V5 越界/非法输入 clamp 到 [0,1] 且不抛异常", _v5_ok, f"volume={_e.volume}")
+
+# V6 UI dB 显示
+check("V6 slider_db(0.0) = -60.0 dB", close(slider_db(0.0), -60.0, 1e-9), f"{slider_db(0.0)}")
+check("V6 slider_db(1.0) = 0.0 dB", close(slider_db(1.0), 0.0, 1e-9), f"{slider_db(1.0)}")
+_dbs = [slider_db(i / 100) for i in range(101)]
+check("V6 dB 读数单调递增", all(b >= a for a, b in zip(_dbs, _dbs[1:])), f"{_dbs[0]:.1f} → {_dbs[-1]:.1f}")
+
+# V7 mute/unmute 往返 + 曲线连续
+_e = AudioEngine()
+_e.set_volume(0.6)
+_g0 = _e.target_gain
+_e.set_muted(True)
+_mute_ok = _e.target_gain == 0.0
+_e.set_muted(False)
+check("V7 mute/unmute 往返恢复原音量",
+      _mute_ok and close(_e.target_gain, _g0, 1e-12) and close(_e.volume, 0.6, 1e-12),
+      f"{_e.target_gain:.6f}")
+
+_e2 = AudioEngine()
+with _e2._lock:
+    _e2._smooth_gain = _e2._target_gain
+    _e2._fade = _FadeEnvelope(1.0, 1.0, _SR, start_gain=1.0)
+_g7: list[float] = []
+for _act in (True, False, True, False):
+    _e2.set_muted(_act)
+    for _ in range(5):
+        _out = _e2._apply_gain_envelope(const(1024), 1024)
+        _g7.extend(max(0.0, _out[i * 2] / 10000.0) for i in range(1024))
+_viol7 = [(a, b) for a, b in zip(_g7, _g7[1:]) if a > 1e-6 and not (0.5 <= b / a <= 2.0)]
+check("V7 mute/unmute 往返曲线连续无跳变", not _viol7, f"违规={len(_viol7)}")
 
 print()
 print("RESULT:", "ALL PASS" if not _FAILS else f"{len(_FAILS)} FAILED -> {_FAILS}")

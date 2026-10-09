@@ -70,3 +70,13 @@ def gain_to_db(gain: float) -> float:
     import math
 
     return max(-MIN_DB, 20.0 * math.log10(g))
+
+
+def slider_db(v: float) -> float:
+    """滑块值 → 显示用 dB（V6）。
+
+    - v = 0.0 → -MIN_DB（默认 -60.0）
+    - v = 1.0 → 0.0
+    - 在 [0,1] 上严格单调递增
+    """
+    return gain_to_db(linear_to_db_gain(v))

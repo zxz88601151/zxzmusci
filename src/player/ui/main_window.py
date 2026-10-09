@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from player.engine.player import AudioEngine, AudioError
 from player.engine.states import ErrorCode
+from player.engine.volume_curve import slider_db
 from player.ui.error_text import describe
 
 logger = logging.getLogger(__name__)
@@ -94,8 +95,12 @@ class MainWindow(QMainWindow):
         self.vol.setRange(0, 100)
         self.vol.setValue(80)
         self.vol.setMaximumWidth(120)
-        self.vol.valueChanged.connect(lambda v: self.engine.set_volume(v / 100.0))
-        self.engine.set_volume(0.8)
+        self.vol.valueChanged.connect(self._on_volume_changed)
+
+        # 【V6】音量 dB 读数：0.0 → -60.0 dB，1.0 → 0.0 dB，单调递增
+        self.vol_db = QLabel()
+        self.vol_db.setMinimumWidth(64)
+        self._on_volume_changed(self.vol.value())
 
         # --- 布局 ---
         top = QHBoxLayout()
@@ -105,6 +110,7 @@ class MainWindow(QMainWindow):
         top.addStretch(1)
         top.addWidget(QLabel("音量"))
         top.addWidget(self.vol)
+        top.addWidget(self.vol_db)
 
         seek_row = QHBoxLayout()
         seek_row.addWidget(self.seek)
@@ -150,6 +156,12 @@ class MainWindow(QMainWindow):
     def _on_stop(self) -> None:
         self.engine.stop()
         self._sync_play_button()
+
+    @guard_audio
+    def _on_volume_changed(self, value: int) -> None:
+        """【V6】滑块 → 引擎音量 + dB 读数（同一套 dB 曲线，保证显示与听感一致）。"""
+        self.engine.set_volume(value / 100.0)
+        self.vol_db.setText(f"{slider_db(value / 100.0):.1f} dB")
 
     @guard_audio
     def _on_seek_released(self) -> None:
