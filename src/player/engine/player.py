@@ -46,8 +46,9 @@ from player.engine.volume_curve import linear_to_db_gain
 logger = logging.getLogger(__name__)
 
 # miniaudio 原生解码的格式；其余走 ffmpeg 管道（Phase 1）
-NATIVE_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".opus"}
-PIPE_EXTS = {".m4a", ".alac", ".ape", ".wma", ".mp4"}
+# 用 frozenset：模块级只留不可变常量，杜绝可变全局状态（R16）
+NATIVE_EXTS = frozenset({".mp3", ".wav", ".flac", ".ogg", ".opus"})
+PIPE_EXTS = frozenset({".m4a", ".alac", ".ape", ".wma", ".mp4"})
 
 _SAMPLE_RATE = 44100
 _NCHANNELS = 2
