@@ -425,7 +425,12 @@ class AudioEngine:
             self._fade = _FadeEnvelope(1.0, self._fade_in_ms, _SAMPLE_RATE, start_gain=start_gain)
         stream = self._pcm_stream(seek_frame, generation)
         self._stream = stream
-        self._device.start(stream)
+        try:
+            self._device.start(stream)
+        except Exception:
+            # 【防泄漏】启动失败时不留悬挂生成器（否则解码器句柄要等 GC 才回收）
+            self._close_decoder()
+            raise
 
     def _close_decoder(self) -> None:
         """六条停止路径（stop/pause/seek/load/错误清理/shutdown）唯一收口。"""
@@ -474,14 +479,23 @@ class AudioEngine:
         step = (end - start) / (count - 1)
         return [start + step * i for i in range(count)]
 
-    def _apply_gain_envelope(self, chunk: array.array, frames: int) -> array.array:
+    def _apply_gain_envelope(
+        self, chunk: array.array, frames: int, generation: int | None = None
+    ) -> array.array:
         """逐帧 final_gain = smooth_gain × fade_gain，再乘到 PCM 上。
 
-        - smooth：指数平滑逼近 `_target_gain`（时间常数 VOLUME_SMOOTH_MS）
-        - fade  ：本段内线性插值（step 返回段首增益，段尾取 current_gain）
+        - smooth：指数平滑逼近 `_target_gain`（时间常数 smooth_ms）
+        - fade  ：本段内按真实轨迹插值（block 返回段首/段尾/有效帧数）
+
+        【竞态防护】`_smooth_gain` 的"读—改—写"横跨两次加锁，本身不是原子操作。
+        因此回写时必须校验代次：若本流已被 seek/load/stop 取代（代次已变），
+        就**丢弃**这次回写，避免旧流 chunk 收尾覆盖新流刚设好的平滑初值。
+        `generation=None` 表示直接调用（测试/工具场景），按当前代次处理。
         """
         n = _NCHANNELS
         with self._lock:
+            if generation is None:
+                generation = self._generation
             smooth = self._smooth_gain
             target = self._target_gain
             # block() 告知"本段内真正处于过渡的帧数 move"：
@@ -506,7 +520,8 @@ class AudioEngine:
             for c in range(n):
                 append(apply(chunk[base + c], g))
         with self._lock:
-            self._smooth_gain = s
+            if generation == self._generation:  # 【竞态防护】代次已变则丢弃回写
+                self._smooth_gain = s
         return out
 
     def _ramp_out_chunk(self, chunk: array.array) -> array.array:
@@ -562,7 +577,7 @@ class AudioEngine:
                     with self._lock:
                         self._fade.reset(0.0, remaining_ms)
                     eof_fade_started = True
-                out = self._apply_gain_envelope(chunk, frames)
+                out = self._apply_gain_envelope(chunk, frames, generation)
                 abs_pos += frames
                 yield out
         except Exception as exc:  # noqa: BLE001

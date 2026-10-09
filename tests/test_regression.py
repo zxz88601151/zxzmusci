@@ -354,6 +354,35 @@ for _f in _src_files:
                     _mutable_globals.append(f"{os.path.basename(_f)}:{_t.id}")
 check("R16 无模块级可变全局（list/dict/set）", not _mutable_globals, str(_mutable_globals))
 
+print("── R17 审计修复（本轮新增）──")
+_e = new_engine()
+_e.load(A)
+_e.play()
+_gen = _e.generation
+with _e._lock:
+    _e._smooth_gain = 0.5
+_e._apply_gain_envelope(array.array("h", [10000, 10000] * 512), 512, generation=_gen - 1)
+check("R17 旧代次的 _smooth_gain 回写被丢弃（不覆盖新流初值）", _e._smooth_gain == 0.5,
+      str(_e._smooth_gain))
+_e._apply_gain_envelope(array.array("h", [10000, 10000] * 512), 512, generation=_gen)
+check("R17 当前代次的回写正常生效", _e._smooth_gain != 0.5, str(_e._smooth_gain))
+
+_e = new_engine()
+_e.load(A)
+_e.play()
+
+
+def _boom(_gen):
+    raise RuntimeError("device start failed")
+
+
+_e._device.start = _boom
+try:
+    _e.seek(0.5)
+except Exception:  # noqa: BLE001
+    pass
+check("R17 device.start() 失败不留悬挂生成器（防泄漏）", _e._stream is None, str(_e._stream))
+
 print()
 print("RESULT:", "ALL PASS" if not _FAILS else f"{len(_FAILS)} FAILED -> {_FAILS}")
 sys.exit(1 if _FAILS else 0)
