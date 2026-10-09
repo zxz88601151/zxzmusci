@@ -40,64 +40,29 @@ jobs:
       - name: 引擎测试（无需 Qt，也不需要显示器）
         run: pytest -m engine -v --tb=short
 
-      # Qt 测试（offscreen 无头）。conftest 的 qt_app fixture 已做降级：
-      # 平台初始化失败 → skip（不是收集错误）。此处系统库齐全则应真跑。
-      - name: Qt 测试（offscreen 无头）
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: pytest -m qt -v --tb=short
-
-      # 【D3 守卫】Qt 用例**全部 skip** 说明 offscreen/系统库没生效 ——
-      # 那是"假绿"：步骤虽然 SUCCESS，实际一条 Qt 断言都没跑。
-      # 上面的降级机制（skip 而非硬错误）是必要的，但必须配这条守卫，
-      # 否则降级会静默吞掉整个 Qt 覆盖率。
+      # Qt 测试（offscreen 无头）+ D3 守卫。
       #
-      # ⚠️ 为什么不解析 "-q" 的汇总行（踩过的坑）：
-      # ① `-q` 在"只有 skip 没有 passed"时**不打印** `N skipped` 汇总行，
-      #    只打 `SKIPPED [1] ...` 详情 → `grep -oE '[0-9]+ passed'` 恒空 → 守卫自己误报；
-      # ② `--collect-only -q` 在 headless 下若平台初始化失败会 INTERNALERROR，
-      #    不打印任何 `tests/...::test_` 行 → 收集数=0 → "TOTAL>0 才判定"永不触发。
-      # 故判据改为**直接数逐条结果行**（`-v` 下每条用例一行，格式稳定），
-      # 并把"收集数=0"也判为失败。
-      - name: "Guard: Qt 用例不得全部被跳过"
-        if: always()
+      # conftest 的 qt_app fixture 在平台初始化失败时**降级为 skip**（必要，
+      # 否则 headless 会变收集期硬错误）。副作用：可能"0 通过 N skip 却 SUCCESS"，
+      # 即**一条 Qt 断言没跑也算绿**。故同一步内跑测试 + 结构化判定。
+      #
+      # 判定逻辑放在 tests/ci_qt_guard.py（可本地单测），workflow 里零 heredoc、
+      # 零文本解析 —— 避免 YAML 块标量缩进与 grep 跨平台差异这两个坑。
+      - name: "Qt 测试（offscreen 无头）+ 守卫"
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
           set -uo pipefail
-
-          # 1) 收集数：`-q --collect-only` 打印 "tests/test_ui_error.py: N"，用 '^tests' 计数
-          COLLECT=$(pytest tests/test_ui_error.py -m qt --collect-only -q 2>&1 || true)
-          echo "--- collect-only ---"; echo "$COLLECT"
-          TOTAL=$(printf '%s\n' "$COLLECT" | grep -cE '^tests' | head -1)
-          TOTAL=${TOTAL:-0}
-
-          # 2) 逐条结果：`-v` 每条用例一行，数 PASSED 行（不依赖任何汇总行）
-          # --color=no 防止 ANSI 转义码插在 "PASSED" 前导致匹配失败。
-          # 正则刻意保持最简（'::.*PASSED'）：实测复杂字符类 [A-Za-z0-9_\[\]-]
-          # 在部分 grep 版本下会因 '\[..\]..-' 连排而**整类失效**（跨平台陷阱）；
-          # '::.*PASSED' 在本地与 GNU grep 上行为一致。汇总行是小写 'passed'，
-          # 不会与逐条的大写 'PASSED' 混淆。
-          OUT=$(pytest tests/test_ui_error.py -m qt -v --tb=no --color=no -p no:cacheprovider 2>&1 || true)
-          echo "--- run (-v) ---"; echo "$OUT"
-          PASSED=$(printf '%s\n' "$OUT" | grep -cE '::.*PASSED' | head -1)
-          PASSED=${PASSED:-0}
-          FAILED=$(printf '%s\n' "$OUT" | grep -cE '::.*FAILED' | head -1)
-          FAILED=${FAILED:-0}
-          SKIPPED=$(printf '%s\n' "$OUT" | grep -cE '::.*SKIPPED' | head -1)
-          SKIPPED=${SKIPPED:-0}
-
-          echo "Qt tests: passed=$PASSED failed=$FAILED skipped=$SKIPPED collected=$TOTAL"
-
-          if [ "$TOTAL" -le 0 ]; then
-            echo "::error::Qt 用例收集数=0（平台初始化失败或 INTERNALERROR）—— 假绿"
-            exit 1
-          fi
-          if [ "$PASSED" -le 0 ]; then
-            echo "::error::Qt 用例 0 passed（failed=$FAILED skipped=$SKIPPED collected=$TOTAL）—— QT_QPA_PLATFORM 或系统库未生效"
-            exit 1
-          fi
-          echo "GUARD PASS: Qt 用例确实执行并通过了 $PASSED 条"
+          rm -f qt_guard.xml
+          set +e
+          pytest -m qt --junitxml=qt_guard.xml -v --tb=short -p no:cacheprovider
+          PYTEST_RC=$?
+          set -e
+          echo "pytest exit code = $PYTEST_RC"
+          echo "--- junitxml ---"
+          cat qt_guard.xml || echo "(无 junitxml)"
+          echo
+          python tests/ci_qt_guard.py qt_guard.xml "$PYTEST_RC"
 
       # 【D4 修复】regression 已拆成 21 个可定位用例（原先仅 1 个）。
       # 失败时可直接从测试名（test_r09_...）定位，无需翻日志。

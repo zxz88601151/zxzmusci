@@ -18,3 +18,6 @@ Thumbs.db
 
 # Agent 本地状态（非项目源码，不上传）
 .workbuddy-ai/
+
+# 提交信息临时文件
+.git-msg.txt
