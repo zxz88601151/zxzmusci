@@ -52,42 +52,52 @@ jobs:
       # 上面的降级机制（skip 而非硬错误）是必要的，但必须配这条守卫，
       # 否则降级会静默吞掉整个 Qt 覆盖率。
       #
-      # ⚠️ 为什么不能只靠 "skipped == collected"：
-      # 在 headless runner 上如果 Qt 平台初始化失败，`--collect-only` 会以
-      # **INTERNALERROR** 结束，**不打印任何 `tests/...::test_` 行** → TOTAL=0 →
-      # "TOTAL>0 才判定"的条件永远不会成立，守卫沦为摆设。
-      # 因此判据必须同时覆盖「收集数 == 0」这一情形。
+      # ⚠️ 为什么不解析 "-q" 的汇总行（踩过的坑）：
+      # ① `-q` 在"只有 skip 没有 passed"时**不打印** `N skipped` 汇总行，
+      #    只打 `SKIPPED [1] ...` 详情 → `grep -oE '[0-9]+ passed'` 恒空 → 守卫自己误报；
+      # ② `--collect-only -q` 在 headless 下若平台初始化失败会 INTERNALERROR，
+      #    不打印任何 `tests/...::test_` 行 → 收集数=0 → "TOTAL>0 才判定"永不触发。
+      # 故判据改为**直接数逐条结果行**（`-v` 下每条用例一行，格式稳定），
+      # 并把"收集数=0"也判为失败。
       - name: "Guard: Qt 用例不得全部被跳过"
         if: always()
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
           set -uo pipefail
+
+          # 1) 收集数：`-q --collect-only` 打印 "tests/test_ui_error.py: N"，用 '^tests' 计数
           COLLECT=$(pytest tests/test_ui_error.py -m qt --collect-only -q 2>&1 || true)
           echo "--- collect-only ---"; echo "$COLLECT"
-          # 注意：`-q --collect-only` 只打印 "tests/test_ui_error.py: 1"（不含 ::test_），
-          # 用 '^tests' 计数才不会把"确实收集到"误判为 0。
           TOTAL=$(printf '%s\n' "$COLLECT" | grep -cE '^tests' | head -1)
           TOTAL=${TOTAL:-0}
 
-          OUT=$(pytest tests/test_ui_error.py -m qt -q --tb=no 2>&1 || true)
-          echo "--- run ---"; echo "$OUT"
-          SKIPPED=$(printf '%s\n' "$OUT" | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' | head -1)
-          SKIPPED=${SKIPPED:-0}
-          PASSED=$(printf '%s\n' "$OUT" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+          # 2) 逐条结果：`-v` 每条用例一行，数 PASSED 行（不依赖任何汇总行）
+          # --color=no 防止 ANSI 转义码插在 "PASSED" 前导致匹配失败。
+          # 正则刻意保持最简（'::.*PASSED'）：实测复杂字符类 [A-Za-z0-9_\[\]-]
+          # 在部分 grep 版本下会因 '\[..\]..-' 连排而**整类失效**（跨平台陷阱）；
+          # '::.*PASSED' 在本地与 GNU grep 上行为一致。汇总行是小写 'passed'，
+          # 不会与逐条的大写 'PASSED' 混淆。
+          OUT=$(pytest tests/test_ui_error.py -m qt -v --tb=no --color=no -p no:cacheprovider 2>&1 || true)
+          echo "--- run (-v) ---"; echo "$OUT"
+          PASSED=$(printf '%s\n' "$OUT" | grep -cE '::.*PASSED' | head -1)
           PASSED=${PASSED:-0}
+          FAILED=$(printf '%s\n' "$OUT" | grep -cE '::.*FAILED' | head -1)
+          FAILED=${FAILED:-0}
+          SKIPPED=$(printf '%s\n' "$OUT" | grep -cE '::.*SKIPPED' | head -1)
+          SKIPPED=${SKIPPED:-0}
 
-          echo "Qt tests: passed=$PASSED skipped=$SKIPPED collected=$TOTAL"
+          echo "Qt tests: passed=$PASSED failed=$FAILED skipped=$SKIPPED collected=$TOTAL"
 
           if [ "$TOTAL" -le 0 ]; then
             echo "::error::Qt 用例收集数=0（平台初始化失败或 INTERNALERROR）—— 假绿"
             exit 1
           fi
           if [ "$PASSED" -le 0 ]; then
-            echo "::error::Qt 用例 0 passed（$SKIPPED skipped / $TOTAL collected）—— QT_QPA_PLATFORM 或系统库未生效"
+            echo "::error::Qt 用例 0 passed（failed=$FAILED skipped=$SKIPPED collected=$TOTAL）—— QT_QPA_PLATFORM 或系统库未生效"
             exit 1
           fi
-          echo "GUARD PASS: Qt 用例确实执行了 $PASSED 条"
+          echo "GUARD PASS: Qt 用例确实执行并通过了 $PASSED 条"
 
       # 【D4 修复】regression 已拆成 21 个可定位用例（原先仅 1 个）。
       # 失败时可直接从测试名（test_r09_...）定位，无需翻日志。
